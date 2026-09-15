@@ -14,6 +14,26 @@ RENDERER = ROOT / "lib/GfxRenderer/GfxRenderer.cpp"
 GRAY_FRAME = ROOT / "lib/GfxRenderer/GrayFrame.h"
 
 STUBS = {
+    "esp_heap_caps.h": r"""
+#pragma once
+#include <cstdlib>
+#include <cstddef>
+constexpr unsigned MALLOC_CAP_SPIRAM = 1;
+constexpr unsigned MALLOC_CAP_8BIT = 2;
+inline int allocationCalls = 0;
+inline int failAllocation = 0;
+inline int liveAllocations = 0;
+inline size_t allocatedBytes = 0;
+inline void* heap_caps_malloc(size_t size, unsigned caps) {
+  if (caps != (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)) std::abort();
+  ++allocationCalls;
+  if (allocationCalls == failAllocation) return nullptr;
+  void* p = std::malloc(size);
+  if (p) { ++liveAllocations; allocatedBytes += size; }
+  return p;
+}
+inline void heap_caps_free(void* p) { if (p) { --liveAllocations; std::free(p); } }
+""",
     "Arduino.h": r"""
 #pragma once
 #include <algorithm>
@@ -75,16 +95,39 @@ HARNESS = r"""
 #include <GfxRenderer.h>
 #include <DirectPixelWriter.h>
 #include <EpdFont.h>
+#include <esp_heap_caps.h>
 
 static std::array<uint8_t, 48000> physical;
+static bool lent = false;
+static bool aborted = false;
+static int submissions = 0;
+static void require(bool condition, const char* name) {
+  if (!condition) {
+    std::fprintf(stderr, "%s: expected true, actual false\n", name);
+    std::exit(1);
+  }
+}
 HalDisplay::HalDisplay() = default;
 HalDisplay::~HalDisplay() = default;
-uint8_t* HalDisplay::getFrameBuffer() const { return physical.data(); }
+uint8_t* HalDisplay::getFrameBuffer() const { return lent ? nullptr : physical.data(); }
 uint16_t HalDisplay::getDisplayWidth() const { return 800; }
 uint16_t HalDisplay::getDisplayHeight() const { return 480; }
 uint16_t HalDisplay::getDisplayWidthBytes() const { return 100; }
 uint32_t HalDisplay::getBufferSize() const { return 48000; }
 void HalDisplay::clearScreen(uint8_t color) const { physical.fill(color); }
+void HalDisplay::displayBuffer(RefreshMode, bool) { ++submissions; }
+void HalDisplay::displayBufferAsync(RefreshMode) { ++submissions; }
+void HalDisplay::beginDisplayWork() { aborted = false; }
+void HalDisplay::abortPostRefresh() { aborted = true; }
+bool HalDisplay::postRefreshAborted() const { return aborted; }
+bool HalDisplay::displayCommitted() const { return !aborted; }
+uint8_t* HalDisplay::lendFrameBufferStorage(uint32_t* size) {
+  if (lent) return nullptr;
+  lent = true;
+  *size = 48000;
+  return physical.data();
+}
+void HalDisplay::returnFrameBufferStorage() { lent = false; physical.fill(0xFF); }
 
 static void expect(const uint8_t* actual, const uint8_t* expected, size_t size, const char* name) {
   for (size_t i = 0; i < size; ++i) {
@@ -95,8 +138,217 @@ static void expect(const uint8_t* actual, const uint8_t* expected, size_t size, 
   }
 }
 
+static void testOwnership(HalDisplay& hal, GfxRenderer& renderer) {
+  using Owner = GfxRenderer::FrameOwner;
+  require(!renderer.uiGrayEnabled() && allocationCalls == 0, "default disabled allocates no selectors");
+  renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  renderer.clearScreen();
+  renderer.displayBuffer();
+  require(submissions == 1, "disabled binary submission preserved");
+  require(!renderer.drawCoverage(1, 2, 2), "disabled coverage refused");
+  for (int failure : {1, 2}) {
+    allocationCalls = 0;
+    failAllocation = failure;
+    {
+      GfxRenderer failing(hal);
+      failing.begin();
+      require(!failing.setUiGrayEnabled(true), "partial allocation rejects enable");
+      require(!failing.uiGrayEnabled() && liveAllocations == 0, "partial allocation releases both halves");
+      require(allocationCalls == 2, "both plane allocations attempted once");
+      require(!failing.setUiGrayEnabled(true) && allocationCalls == 2, "failed pair is not repeatedly allocated");
+      failing.beginDisplayWork();
+      failing.clearScreen();
+      failing.displayBuffer();
+      require(failing.liveFrameValid(), "failed allocation retains binary frame");
+      std::array<uint8_t, 100> readerL{}, readerM{};
+      failing.beginDualStripTarget(readerL.data(), readerM.data(), 0, 1);
+      failing.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+      failing.setRenderMode(GfxRenderer::GRAYSCALE_BOTH);
+      failing.drawGrayPixel(0, 0, true, true);
+      require(readerL[0] == 0x80 && readerM[0] == 0x80, "allocation fallback preserves reader selector AA");
+      failing.endStripTarget();
+    }
+  }
+  allocationCalls = 0;
+  failAllocation = 0;
+  allocatedBytes = 0;
+  require(renderer.setUiGrayEnabled(true), "enable retained gray pair");
+  require(allocationCalls == 2 && liveAllocations == 2 && allocatedBytes == 96000, "96 KB pair allocated in PSRAM");
+  require(renderer.liveFrameNeedsRedraw() && !renderer.canCaptureLiveFrame(), "policy change requires full redraw");
+  renderer.clearScreen();
+  require(renderer.liveFrameValid() && renderer.coverageEnabled(), "full clear establishes live tuple");
+  require(renderer.drawCoverage(1, 2, 2), "live coverage operation");
+  const uint8_t* liveL = renderer.getLiveGrayPlane(true);
+  const uint8_t* liveM = renderer.getLiveGrayPlane(false);
+  require(physical[200] == 0xBF && liveL[200] == 0x40 && liveM[200] == 0x40, "live dark marker literal tuple");
+  std::array<uint8_t, 48000> expectedLive;
+  expectedLive.fill(0xFF); expectedLive[200] = 0xBF;
+  std::array<uint8_t, 48000> expectedSelectors{};
+  expectedSelectors[200] = 0x40;
+  std::array<uint8_t, 300> outer, inner;
+  outer.fill(0x11); inner.fill(0x22);
+  renderer.setGrayscaleClipRect(4, 5, 6, 7);
+  const uint32_t originalGeneration = renderer.getTargetGeneration();
+  {
+    GfxRenderer::ScopedTarget target(renderer, outer.data(), 2, 3);
+    require(target.active() && renderer.getFrameOwner() == Owner::OffscreenBw, "offscreen BW owns strip");
+    require(!renderer.isTargetCurrent(originalGeneration), "new binding rejects cached live target");
+    require(!renderer.canCaptureLiveFrame() && !renderer.coverageEnabled(), "scratch refuses live capture and coverage");
+    renderer.clearScreen(0);
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+    renderer.setGrayscaleClipRect(1, 2, 3, 4);
+    const uint32_t outerGeneration = renderer.getTargetGeneration();
+    {
+      GfxRenderer::ScopedTarget nested(renderer, inner.data(), 3, 3);
+      renderer.setRenderMode(GfxRenderer::BW_GRAY_BASE);
+      renderer.clearGrayscaleClipRect();
+      renderer.clearScreen(0xA5);
+      renderer.displayBuffer();
+    }
+    require(renderer.getWriteTarget() == outer.data() && renderer.getWriteOriginY() == 2 && renderer.getWriteRows() == 3,
+            "nested target restores pointer and physical band");
+    require(renderer.getRenderMode() == GfxRenderer::GRAYSCALE_LSB && renderer.grayscaleClipEnabled() &&
+            renderer.grayscaleClipX0() == 1 && renderer.grayscaleClipY0() == 2 && renderer.grayscaleClipX1() == 4 &&
+            renderer.grayscaleClipY1() == 6, "nested scope restores mode and clip");
+    require(!renderer.isTargetCurrent(outerGeneration), "restored target gets a fresh generation");
+    renderer.clearScreen(0x33);
+  }
+  require(renderer.getWriteTarget() == physical.data() && renderer.getRenderMode() == GfxRenderer::BW &&
+          renderer.grayscaleClipX0() == 4 && renderer.grayscaleClipY0() == 5 && renderer.grayscaleClipX1() == 10 &&
+          renderer.grayscaleClipY1() == 12, "outer scope restores live metadata");
+  require(renderer.coverageEnabled() && !renderer.isTargetCurrent(originalGeneration), "coverage restored and old generation stays stale");
+  std::array<uint8_t, 300> expectedOuter, expectedInner;
+  expectedOuter.fill(0x33); expectedInner.fill(0xA5);
+  expect(outer.data(), expectedOuter.data(), 300, "scope keeps written outer bytes");
+  expect(inner.data(), expectedInner.data(), 300, "scope keeps written inner bytes");
+  expect(physical.data(), expectedLive.data(), 48000, "scoped scratch preserves live B");
+  expect(liveL, expectedSelectors.data(), 48000, "scoped scratch preserves live L");
+  expect(liveM, expectedSelectors.data(), 48000, "scoped scratch preserves live M");
+  require(submissions == 3, "offscreen display makes no submission");
+  renderer.clearGrayscaleClipRect();
+  {
+    GfxRenderer::ScopedTarget scope(renderer, outer.data(), 2, 3);
+    renderer.beginStripTarget(inner.data(), 3, 3);
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+  }
+  renderer.beginStripTarget(inner.data(), 3, 3);
+  renderer.endStripTarget();
+  require(renderer.getWriteTarget() == physical.data() && renderer.getRenderMode() == GfxRenderer::BW,
+          "scope unwinds unfinished legacy strip metadata");
+  {
+    GfxRenderer::ScopedTarget base(renderer, Owner::ReaderBase);
+    require(base.active() && !renderer.coverageEnabled(), "reader base suspends UI coverage");
+    renderer.setRenderMode(GfxRenderer::BW_GRAY_BASE);
+    GfxRenderer::FrameBufferLoan refused(renderer);
+    require(renderer.hasFrameBuffer(), "reader base refuses framebuffer loan");
+  }
+  std::array<uint8_t, 300> slotB, slotL, slotM;
+  bool coherent = false;
+  GrayFrame slot({slotB.data(), 300}, {slotL.data(), 300}, {slotM.data(), 300}, 800, 3, 100, 3);
+  renderer.beginDisplayWork();
+  {
+    GfxRenderer::ScopedTarget target(renderer, slot, coherent);
+    require(target.active() && renderer.getFrameOwner() == Owner::OffscreenFrame, "offscreen tuple binds");
+    renderer.clearScreen();
+    require(coherent && renderer.drawCoverage(0, 3, 1), "offscreen full clear establishes tuple");
+    require(slotB[0] == 0xFF && slotL[0] == 0 && slotM[0] == 0x80, "offscreen light marker literal tuple");
+    renderer.abortDisplayWork();
+    require(coherent && renderer.liveFrameValid(), "input cancellation changes no tuple validity");
+  }
+  require(!coherent && renderer.liveFrameValid(), "cancelled offscreen invalidates only slot");
+  renderer.beginDisplayWork();
+  expect(physical.data(), expectedLive.data(), 48000, "cancelled offscreen preserves live B");
+  expect(liveL, expectedSelectors.data(), 48000, "cancelled offscreen preserves live L");
+  expect(liveM, expectedSelectors.data(), 48000, "cancelled offscreen preserves live M");
+  {
+    GfxRenderer::ScopedTarget ui(renderer, Owner::LiveUi);
+    renderer.abortDisplayWork();
+    require(renderer.liveFrameValid(), "input cancellation leaves live metadata for render thread");
+  }
+  require(!renderer.liveFrameValid() && !renderer.canCaptureLiveFrame(), "cancelled live tuple needs redraw");
+  renderer.displayBuffer();
+  require(submissions == 3, "cancelled live frame refuses submission");
+  renderer.beginDisplayWork();
+  renderer.clearScreen();
+  require(renderer.drawCoverage(1, 2, 2), "new generation full clear recovers live frame");
+  {
+    GfxRenderer::ScopedTarget scratch(renderer, Owner::ReaderScratch);
+    require(renderer.getRenderMode() == GfxRenderer::BW && !renderer.coverageEnabled(), "scratch ownership precedes mode change");
+    renderer.clearScreen(0);
+    require(!renderer.canCaptureLiveFrame(), "HAL scratch refuses live capture");
+    expect(liveL, expectedSelectors.data(), 48000, "HAL scratch clear preserves live L");
+    expect(liveM, expectedSelectors.data(), 48000, "HAL scratch clear preserves live M");
+  }
+  require(renderer.liveFrameNeedsRedraw(), "scratch cannot restore validity without restoring bytes");
+  renderer.clearScreen();
+  {
+    GfxRenderer::ScopedTarget alias(renderer, physical.data(), 0, 1);
+    require(alias.active() && renderer.getFrameOwner() == Owner::ReaderScratch, "HAL alias is reader scratch");
+    renderer.clearScreen(0);
+  }
+  require(renderer.liveFrameNeedsRedraw(), "HAL strip alias requires live redraw");
+  renderer.clearScreen();
+  require(renderer.drawCoverage(1, 2, 2), "secondary alias starts with live gray marker");
+  renderer.beginDualStripTarget(outer.data(), physical.data(), 0, 1);
+  require(renderer.getFrameOwner() == Owner::ReaderScratch && renderer.liveFrameNeedsRedraw(),
+          "legacy secondary HAL alias owns reader scratch and invalidates live frame");
+  renderer.clearScreen(0);
+  require(physical[0] == 0x00 && physical[99] == 0x00 && physical[100] == 0xFF && physical[200] == 0xBF,
+          "secondary alias clear changes only its HAL band");
+  expect(liveL, expectedSelectors.data(), 48000, "secondary alias clear preserves live L");
+  expect(liveM, expectedSelectors.data(), 48000, "secondary alias clear preserves live M");
+  renderer.endStripTarget();
+  require(renderer.getWriteTarget() == physical.data() && renderer.getFrameOwner() == Owner::LiveUi,
+          "secondary alias end restores live target metadata");
+  require(renderer.liveFrameNeedsRedraw() && !renderer.canCaptureLiveFrame() && physical[0] == 0x00,
+          "secondary alias end restores neither bytes nor coherence");
+  renderer.displayBuffer();
+  require(submissions == 3 && !renderer.drawCoverage(0, 0, 2),
+          "secondary alias cannot publish or blend before full rebuild");
+  renderer.clearScreen();
+  uint8_t rebuilt = 0;
+  require(renderer.liveFrameValid() && renderer.readFramebufferRegion(0, 0, 8, 1, &rebuilt, 1) == 1 && rebuilt == 0xFF,
+          "secondary alias full rebuild restores usable live frame");
+  const auto beforeLoan = renderer.getTargetGeneration();
+  {
+    GfxRenderer::FrameBufferLoan loan(renderer);
+    GfxRenderer::FrameBufferLoan nested(renderer);
+    require(!renderer.hasFrameBuffer() && renderer.getFrameOwner() == Owner::Loan, "loan owns live storage");
+    require(!renderer.isTargetCurrent(beforeLoan) && !renderer.getWriteTarget(), "loan rejects cached target");
+    physical.fill(0x5A);
+    renderer.clearScreen();
+    renderer.drawPixel(0, 0);
+    renderer.fillRect(0, 0, 8, 2);
+    renderer.invertScreen();
+    renderer.displayBuffer();
+    renderer.displayBufferAsync();
+    uint8_t capture = 0x77;
+    require(renderer.readFramebufferRegion(0, 0, 8, 1, &capture, 1) == 0 && capture == 0x77, "loan refuses capture");
+    require(!renderer.copyRegionToBuffer(0, 0, 8, 1, &capture, 1), "loan refuses region copy");
+    require(!renderer.drawCoverage(0, 0, 2), "loan refuses coverage");
+    GfxRenderer::ScopedTarget refused(renderer, outer.data(), 2, 3);
+    require(!refused.active(), "loan refuses target binding");
+    nested.end();
+    require(!renderer.hasFrameBuffer() && physical[0] == 0x5A && submissions == 3, "nested loan cannot restore outer storage");
+  }
+  std::array<uint8_t, 48000> white, zero{}; white.fill(0xFF);
+  expect(physical.data(), white.data(), 48000, "loan returns white B");
+  expect(liveL, zero.data(), 48000, "loan clears L");
+  expect(liveM, zero.data(), 48000, "loan clears M");
+  require(renderer.liveFrameNeedsRedraw() && !renderer.canCaptureLiveFrame(), "loan return requires full redraw");
+  renderer.displayBuffer();
+  require(submissions == 3, "loan return cannot publish blank partial frame");
+  renderer.clearScreen();
+  require(renderer.canCaptureLiveFrame(), "full clear recovers after loan");
+  require(renderer.setUiGrayEnabled(false) && renderer.liveFrameNeedsRedraw(), "disabling policy requires redraw");
+  renderer.clearScreen();
+  require(renderer.setUiGrayEnabled(true) && allocationCalls == 2 && liveAllocations == 2, "policy toggle reuses pair");
+}
+
 int main() {
   HalDisplay hal;
+  {
   GfxRenderer renderer(hal);
   renderer.begin();
   renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
@@ -159,7 +411,15 @@ int main() {
   data.intervalCount = 1;
   EpdFont font(&data);
   if (font.getGlyph(65) != &glyph) return 2;
-  std::puts("PASS: actual renderer HAL/strip binding, pixel transforms, DirectPixelWriter and font lookup");
+  {
+    GfxRenderer::FrameBufferLoan loan(renderer);
+    renderer.displayBuffer();
+    require(submissions == 0, "loan refuses HAL submission");
+  }
+  testOwnership(hal, renderer);
+  std::puts("PASS: actual renderer HAL/strip binding, pixel transforms, DirectPixelWriter, ownership, allocation, cancellation and loans");
+  }
+  require(liveAllocations == 0, "renderer destruction releases pair");
 }
 """
 
@@ -406,18 +666,24 @@ class RendererSeamTest(unittest.TestCase):
             subprocess.run([*cxx, dead_strip, *objects, "-o", str(binary)], check=True)
 
             source = RENDERER.read_text()
-            original = "    return;\n  }\n  display.clearScreen(color);"
-            self.assertEqual(source.count(original), 1, "strip-clear mutant anchor changed")
             mutated = work / "GfxRenderer-mutant.cpp"
-            mutated.write_text(source.replace(original, "  }\n  display.clearScreen(color);"))
             mutant_object = work / "renderer-mutant.o"
-            subprocess.run([*cxx, "-std=c++17", *common, "-c", str(mutated), "-o", str(mutant_object)], check=True)
             mutant_binary = work / "gfx-gray-mutant"
-            subprocess.run([*cxx, dead_strip, str(mutant_object), *objects[1:], "-o", str(mutant_binary)], check=True)
-            result = subprocess.run([str(mutant_binary)], capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0, "strip clear incorrectly touching HAL survived")
-            self.assertIn("strip preserves HAL: byte 0 expected FF, actual 00", result.stderr)
-            print("EXPECTED MUTANT FAILURE:", result.stderr.strip())
+            mutants = [
+                ("strip clear", "    return;\n  }\n  display.clearScreen(color);",
+                 "  }\n  display.clearScreen(color);", "strip preserves HAL: byte 0 expected FF, actual 00"),
+                ("scope restoration", "  renderer_.target_ = previous_;", "  renderer_.target_ = {};",
+                 "nested target restores pointer and physical band: expected true, actual false"),
+            ]
+            for name, original, replacement, expected_error in mutants:
+                self.assertEqual(source.count(original), 1, f"{name} mutant anchor changed")
+                mutated.write_text(source.replace(original, replacement))
+                subprocess.run([*cxx, "-std=c++17", *common, "-c", str(mutated), "-o", str(mutant_object)], check=True)
+                subprocess.run([*cxx, dead_strip, str(mutant_object), *objects[1:], "-o", str(mutant_binary)], check=True)
+                result = subprocess.run([str(mutant_binary)], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, f"{name} mutant survived")
+                self.assertIn(expected_error, result.stderr)
+                print("EXPECTED MUTANT FAILURE:", result.stderr.strip())
             self.assertEqual(RENDERER.read_text(), source, "production source changed during test")
             subprocess.run([str(binary)], check=True)
 

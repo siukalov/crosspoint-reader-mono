@@ -16,6 +16,14 @@ class GrayFrame {
   GrayFrame(Plane b, Plane l, Plane m, size_t width, size_t rows, size_t stride, size_t y0 = 0)
       : b_(b), l_(l), m_(m), width_(width), rows_(rows), stride_(stride), y0_(y0) {}
 
+  Plane b() const { return b_; }
+  Plane l() const { return l_; }
+  Plane m() const { return m_; }
+  size_t width() const { return width_; }
+  size_t rows() const { return rows_; }
+  size_t stride() const { return stride_; }
+  size_t y0() const { return y0_; }
+
   bool valid() const {
     return width_ != 0 && rows_ != 0 && stride_ >= width_ / 8 + (width_ % 8 != 0) &&
            y0_ <= std::numeric_limits<size_t>::max() - rows_ && fits(b_) && fits(l_) && fits(m_);
