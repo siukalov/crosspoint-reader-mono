@@ -35,6 +35,31 @@ class GfxRenderer {
     LandscapeCounterClockwise  // 800x480 logical coordinates, native panel orientation
   };
 
+  enum class SnapshotKind { RetainedTuple, LegacyBw };
+  enum class FrameResult {
+    Ok,
+    Unavailable,
+    InvalidLive,
+    InvalidSource,
+    GeometryMismatch,
+    PolicyMismatch,
+    ShortCapacity,
+    Cancelled,
+    PublishedCancelled
+  };
+
+  struct FrameSnapshot {
+    GrayFrame planes;
+    size_t physicalByteX = 0;
+    uint16_t panelWidth = 0;
+    uint16_t panelHeight = 0;
+    uint16_t panelStride = 0;
+    Orientation orientation = Portrait;
+    SnapshotKind kind = SnapshotKind::LegacyBw;
+    uint64_t restoreEpoch = 0;
+    bool valid = false;
+  };
+
  private:
   static constexpr size_t BW_BUFFER_CHUNK_SIZE = 8000;  // 8KB chunks to allow for non-contiguous memory
 
@@ -84,6 +109,7 @@ class GfxRenderer {
   mutable bool liveCoherent_ = true;
   mutable bool cancellationAccounted_ = false;
   mutable uint32_t workGeneration_ = 0;
+  mutable uint64_t restoreEpoch_ = 0;
   struct ReaderImport {
     bool active = false;
     uint32_t target = 0;
@@ -139,6 +165,10 @@ class GfxRenderer {
   bool liveFrameValid() const { return frameBuffer && liveCoherent_; }
   bool liveFrameNeedsRedraw() const { return !liveFrameValid(); }
   bool canCaptureLiveFrame() const;
+  size_t regionSnapshotBytes(int x, int y, int width, int height) const;
+  size_t frameSnapshotBytes() const;
+  FrameResult captureRegion(int x, int y, int width, int height, GrayFrame::Plane storage, FrameSnapshot& out) const;
+  FrameResult captureFrame(GrayFrame::Plane storage, FrameSnapshot& out) const;
   const uint8_t* getLiveGrayPlane(bool lsb) const {
     return uiGrayEnabled_ && canCaptureLiveFrame() ? (lsb ? liveL_ : liveM_) : nullptr;
   }

@@ -102,6 +102,7 @@ inline HostStorage Storage;
 
 HARNESS = r"""
 #include <array>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -113,6 +114,20 @@ HARNESS = r"""
 #include <esp_heap_caps.h>
 
 static std::array<uint8_t, 48000> physical;
+static GfxRenderer* captureAbortRenderer = nullptr;
+static uint8_t* captureAbortDestination = nullptr;
+static int captureAbortHits = 0;
+extern "C" void* memcpy(void* destination, const void* source, size_t size)
+    noexcept(noexcept(std::memcpy(destination, source, size))) {
+  void* result = std::memmove(destination, source, size);
+  if (captureAbortRenderer && destination == captureAbortDestination) {
+    GfxRenderer* renderer = captureAbortRenderer;
+    captureAbortRenderer = nullptr;
+    ++captureAbortHits;
+    renderer->abortDisplayWork();
+  }
+  return result;
+}
 static bool lent = false;
 static bool aborted = false;
 static int submissions = 0;
@@ -1073,6 +1088,220 @@ static void testOpaqueWriters(HalDisplay& hal) {
   testWriterOwnerControls(renderer);
 }
 
+
+static void testLegacySnapshot(GfxRenderer& renderer) {
+  using Result = GfxRenderer::FrameResult;
+  GfxRenderer::FrameSnapshot snapshot;
+  renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  renderer.clearScreen();
+  physical.fill(0x22);
+  renderer.copyGrayscaleLsbBuffers();
+  physical.fill(0x66);
+  renderer.copyGrayscaleMsbBuffers();
+  physical.fill(0xCC);
+  const int before = graySubmissions;
+  renderer.displayGrayBuffer();
+  require(graySubmissions == before + 1 && stagedL[0] == 0x22 && stagedM[0] == 0x66,
+          "legacy snapshot follows actual gray submission");
+  require(renderer.regionSnapshotBytes(1, 2, 5, 1) == 1 && renderer.frameSnapshotBytes() == 48000,
+          "legacy snapshot uses one plane");
+  std::array<uint8_t, 48002> packed;
+  packed.fill(0xA5);
+  require(renderer.captureFrame({packed.data() + 1, 48000}, snapshot) == Result::Ok && snapshot.valid,
+          "legacy full capture succeeds");
+  require(snapshot.kind == GfxRenderer::SnapshotKind::LegacyBw, "legacy capture truthfully reports BW");
+  require(!snapshot.planes.l().data && !snapshot.planes.m().data && !snapshot.planes.valid(),
+          "legacy capture invents no selectors");
+  require(snapshot.planes.b().capacity == 48000 && snapshot.planes.stride() == 100 &&
+          snapshot.planes.width() == 800 && snapshot.planes.rows() == 480 && snapshot.physicalByteX == 0 &&
+          snapshot.planes.y0() == 0, "legacy full capture metadata");
+  std::array<uint8_t, 48000> expected;
+  expected.fill(0xCC);
+  expect(packed.data() + 1, expected.data(), expected.size(), "legacy B literal");
+  expect(physical.data(), expected.data(), expected.size(), "legacy capture preserves live B");
+  require(packed.front() == 0xA5 && packed.back() == 0xA5, "legacy packed canaries");
+}
+
+static void testSnapshots(HalDisplay& hal) {
+  using Result = GfxRenderer::FrameResult;
+  using Snapshot = GfxRenderer::FrameSnapshot;
+  for (int failure : {0, 1, 2}) {
+    GfxRenderer fallback(hal);
+    fallback.begin();
+    if (failure) {
+      failAllocation = allocationCalls + failure;
+      require(!fallback.setUiGrayEnabled(true), "snapshot pair allocation failure remains disabled");
+    }
+    testLegacySnapshot(fallback);
+    failAllocation = 0;
+  }
+
+  GfxRenderer renderer(hal);
+  renderer.begin();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  require(renderer.setUiGrayEnabled(true), "snapshot enables retained tuple");
+  Snapshot snapshot;
+  std::array<uint8_t, 144002> packed;
+  packed.fill(0xA5);
+  const auto untouched = packed;
+  require(renderer.frameSnapshotBytes() == 144000, "snapshot size ignores invalid live state");
+  snapshot.valid = true;
+  require(renderer.captureFrame({packed.data() + 1, 144000}, snapshot) == Result::InvalidLive && !snapshot.valid,
+          "capture rejects invalid live and invalidates output");
+  expect(packed.data(), untouched.data(), packed.size(), "invalid live preserves storage");
+  renderer.beginDisplayWork();
+  renderer.clearScreen();
+  auto tuple = renderer.getWriteTuple();
+  std::memset(tuple.b().data, 0xCC, 48000);
+  std::memset(tuple.l().data, 0x22, 48000);
+  std::memset(tuple.m().data, 0x66, 48000);
+  tuple.b().data[201] = 0x33;
+  tuple.l().data[201] = 0x44;
+  tuple.b().data[600] = 0x33;
+  tuple.b().data[700] = 0x55;
+  tuple.l().data[600] = 0x44;
+  tuple.l().data[700] = 0x88;
+  tuple.m().data[600] = 0x99;
+  tuple.m().data[700] = 0xAA;
+  std::array<uint8_t, 48000> originalB, originalL, originalM;
+  std::memcpy(originalB.data(), tuple.b().data, 48000);
+  std::memcpy(originalL.data(), tuple.l().data, 48000);
+  std::memcpy(originalM.data(), tuple.m().data, 48000);
+  const int before = submissions + graySubmissions + baseSubmissions;
+  require(renderer.regionSnapshotBytes(1, 2, 5, 1) == 3, "aligned padding uses three bytes");
+  require(renderer.captureRegion(1, 2, 5, 1, {packed.data() + 1, 3}, snapshot) == Result::Ok && snapshot.valid,
+          "aligned padding capture succeeds");
+  const uint8_t padding[] = {0xCC, 0x22, 0x66};
+  expect(packed.data() + 1, padding, 3, "capture literal aligned padding");
+  require(snapshot.kind == GfxRenderer::SnapshotKind::RetainedTuple && snapshot.planes.valid() &&
+          snapshot.planes.width() == 8 && snapshot.planes.stride() == 1 && snapshot.planes.rows() == 1 &&
+          snapshot.planes.y0() == 2 && snapshot.physicalByteX == 0 && snapshot.panelWidth == 800 &&
+          snapshot.panelHeight == 480 && snapshot.panelStride == 100 && snapshot.restoreEpoch == 0,
+          "retained capture metadata");
+  require(snapshot.planes.b().data == packed.data() + 1 && snapshot.planes.l().data == packed.data() + 2 &&
+          snapshot.planes.m().data == packed.data() + 3 && snapshot.planes.b().capacity == 1 &&
+          snapshot.planes.l().capacity == 1 && snapshot.planes.m().capacity == 1,
+          "retained capture packed plane views");
+
+  for (size_t capacity : {size_t(0), size_t(1), size_t(2)}) {
+    packed.fill(0xA5);
+    snapshot.valid = true;
+    require(renderer.captureRegion(1, 2, 5, 1, {packed.data() + 1, capacity}, snapshot) == Result::ShortCapacity &&
+            !snapshot.valid, "capture short capacity rejected");
+    expect(packed.data(), untouched.data(), packed.size(), "short capacity preserves storage");
+  }
+  require(renderer.captureRegion(1, 2, 5, 1, {packed.data() + 1, std::numeric_limits<size_t>::max()}, snapshot) ==
+          Result::Ok && packed[0] == 0xA5 && packed[4] == 0xA5, "capture validates used storage extent");
+  for (uint8_t* plane : {tuple.b().data, tuple.l().data, tuple.m().data}) {
+    for (size_t offset : {size_t(0), size_t(1), size_t(47999)}) {
+      snapshot.valid = true;
+      require(renderer.captureRegion(1, 2, 5, 1, {plane + offset, 3}, snapshot) == Result::InvalidSource &&
+              !snapshot.valid, "capture offset alias rejected");
+    }
+  }
+  for (uint8_t* invalid : {static_cast<uint8_t*>(nullptr),
+                          reinterpret_cast<uint8_t*>(std::numeric_limits<uintptr_t>::max() - 1)}) {
+    require(renderer.captureRegion(1, 2, 5, 1, {invalid, 3}, snapshot) == Result::InvalidSource,
+            "capture invalid address rejected");
+  }
+  const GfxRenderer::Orientation orientations[] = {GfxRenderer::LandscapeCounterClockwise,
+      GfxRenderer::LandscapeClockwise, GfxRenderer::Portrait, GfxRenderer::PortraitInverted};
+  const int rectangles[][4] = {{3, 5, 5, 3}, {792, 472, 5, 3}, {472, 3, 3, 5}, {5, 792, 3, 5}};
+  const size_t partialByteX[] = {0, 99, 0, 99};
+  const size_t partialY[] = {0, 479, 479, 0};
+  const uint8_t oriented[] = {0xCC, 0x33, 0x55, 0x22, 0x44, 0x88, 0x66, 0x99, 0xAA};
+  const int invalidRects[][4] = {{INT_MIN, 0, 1, 1}, {INT_MAX - 1, 0, 1, 1}, {0, INT_MIN, 1, 1},
+      {0, INT_MAX - 1, 1, 1}, {INT_MIN, 0, INT_MAX, 1}, {0, INT_MIN, 1, INT_MAX},
+      {INT_MAX, INT_MAX, INT_MAX, INT_MAX}, {0, 0, 0, 1}, {0, 0, 1, -1}};
+  for (size_t index = 0; index < 4; ++index) {
+    renderer.setOrientation(orientations[index]);
+    const int* r = rectangles[index];
+    packed.fill(0xA5);
+    require(renderer.regionSnapshotBytes(r[0], r[1], r[2], r[3]) == 9 &&
+            renderer.captureRegion(r[0], r[1], r[2], r[3], {packed.data() + 1, 9}, snapshot) == Result::Ok,
+            "oriented snapshot size and capture");
+    require(snapshot.physicalByteX == 0 && snapshot.planes.y0() == 5 && snapshot.planes.stride() == 1 &&
+            snapshot.planes.rows() == 3 && snapshot.orientation == orientations[index],
+            "oriented snapshot physical coordinates");
+    expect(packed.data() + 1, oriented, 9, "oriented snapshot literal planes");
+    require(packed[0] == 0xA5 && packed[10] == 0xA5, "oriented snapshot canaries");
+    require(renderer.regionSnapshotBytes(1, 1, INT_MAX, INT_MAX) > 0,
+            "wide endpoint clipping remains visible");
+    require(renderer.captureRegion(-2, -3, 3, 4, {packed.data() + 1, 3}, snapshot) == Result::Ok &&
+            snapshot.physicalByteX == partialByteX[index] && snapshot.planes.y0() == partialY[index] &&
+            snapshot.planes.rows() == 1 && snapshot.planes.stride() == 1,
+            "partially visible capture clips before rotation");
+    expect(packed.data() + 1, padding, 3, "partial clipping literal planes");
+    require(renderer.captureRegion(renderer.getScreenWidth() - 1, renderer.getScreenHeight() - 1,
+            INT_MAX, INT_MAX, {packed.data() + 1, 3}, snapshot) == Result::Ok,
+            "wide endpoint capture clips before rotation");
+    for (const auto& invalid : invalidRects) {
+      packed.fill(0xA5);
+      snapshot.valid = true;
+      require(renderer.regionSnapshotBytes(invalid[0], invalid[1], invalid[2], invalid[3]) == 0,
+              "extreme offscreen snapshot size is zero");
+      require(renderer.captureRegion(invalid[0], invalid[1], invalid[2], invalid[3],
+              {packed.data() + 1, 144000}, snapshot) == Result::InvalidSource && !snapshot.valid,
+              "extreme offscreen capture rejected");
+      expect(packed.data(), untouched.data(), packed.size(), "extreme offscreen preserves storage");
+    }
+  }
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  packed.fill(0xA5);
+  require(renderer.captureFrame({packed.data() + 1, 144000}, snapshot) == Result::Ok && snapshot.valid &&
+          snapshot.planes.width() == 800 && snapshot.planes.stride() == 100 && snapshot.planes.rows() == 480 &&
+          snapshot.physicalByteX == 0 && snapshot.planes.y0() == 0, "full tuple capture metadata");
+  expect(packed.data() + 1, originalB.data(), 48000, "full capture B");
+  expect(packed.data() + 48001, originalL.data(), 48000, "full capture L");
+  expect(packed.data() + 96001, originalM.data(), 48000, "full capture M");
+  require(packed.front() == 0xA5 && packed.back() == 0xA5, "full capture canaries");
+  packed.fill(0xA5);
+  captureAbortDestination = packed.data() + 1;
+  captureAbortRenderer = &renderer;
+  require(renderer.captureFrame({packed.data() + 1, 144000}, snapshot) == Result::Cancelled && !snapshot.valid &&
+          captureAbortHits == 1, "late capture abort invalidates descriptor");
+  require(packed[1] == 0xCC, "late capture abort follows a real copy");
+  expect(physical.data(), originalB.data(), 48000, "captures preserve live B");
+  expect(tuple.l().data, originalL.data(), 48000, "captures preserve live L");
+  expect(tuple.m().data, originalM.data(), 48000, "captures preserve live M");
+  packed.fill(0xA5);
+  snapshot.valid = true;
+  require(renderer.captureFrame({packed.data() + 1, 144000}, snapshot) == Result::Cancelled && !snapshot.valid,
+          "pre-cancelled capture rejected");
+  expect(packed.data(), untouched.data(), packed.size(), "pre-cancelled capture preserves storage");
+  renderer.beginDisplayWork();
+  renderer.clearScreen();
+  for (auto owner : {GfxRenderer::FrameOwner::ReaderBase, GfxRenderer::FrameOwner::ReaderScratch}) {
+    GfxRenderer::ScopedTarget scope(renderer, owner);
+    snapshot.valid = true;
+    require(renderer.captureFrame({packed.data() + 1, 144000}, snapshot) == Result::Unavailable && !snapshot.valid,
+            "reader ownership rejects snapshot");
+  }
+  std::array<uint8_t, 100> strip{};
+  {
+    GfxRenderer::ScopedTarget scope(renderer, strip.data(), 0, 1);
+    require(renderer.captureFrame({packed.data() + 1, 144000}, snapshot) == Result::Unavailable,
+            "offscreen strip rejects snapshot");
+  }
+  {
+    bool coherent = true;
+    GrayFrame offscreen({packed.data() + 1, 100}, {packed.data() + 101, 100}, {packed.data() + 201, 100},
+                        800, 1, 100);
+    GfxRenderer::ScopedTarget scope(renderer, offscreen, coherent);
+    require(scope.active() && renderer.captureFrame({packed.data() + 301, 144000}, snapshot) == Result::Unavailable,
+            "offscreen tuple rejects snapshot");
+  }
+  {
+    GfxRenderer::FrameBufferLoan loan(renderer);
+    require(renderer.frameSnapshotBytes() == 144000 &&
+            renderer.captureFrame({packed.data() + 1, 144000}, snapshot) == Result::Unavailable,
+            "loan rejects capture but permits sizing");
+  }
+  expect(packed.data(), untouched.data(), packed.size(), "unavailable captures preserve storage");
+  require(submissions + graySubmissions + baseSubmissions == before, "captures submit no display work");
+}
+
 int main() {
   HalDisplay hal;
   {
@@ -1148,6 +1377,7 @@ int main() {
   testReaderImport(renderer);
   testGlyphCoverage(hal);
   testOpaqueWriters(hal);
+  testSnapshots(hal);
   std::puts("PASS: actual renderer ownership, submission, imports, glyphs, opaque writers, image clipping and stale target controls");
   }
   require(liveAllocations == 0, "renderer destruction releases pair");
@@ -1383,7 +1613,7 @@ class RendererSeamTest(unittest.TestCase):
             cxx = shlex.split(os.environ.get("CXX", "clang++"))
             cc = shlex.split(os.environ.get("CC", "clang"))
             includes = [f"-I{work}", *(f"-I{ROOT / path}" for path in INCLUDES)]
-            common = ["-O1", "-g", "-ffunction-sections", "-fdata-sections", *includes]
+            common = ["-O1", "-g", "-fno-builtin-memcpy", "-ffunction-sections", "-fdata-sections", *includes]
             objects = []
             sources = [RENDERER, *(ROOT / path for path in CPP_SOURCES), harness]
             sources += sorted((ROOT / "lib/uzlib/src").glob("*.c"))
@@ -1433,6 +1663,20 @@ class RendererSeamTest(unittest.TestCase):
                 ("offscreen image bypass", "  drawPhysicalImage(bitmap, rotatedX, rotatedY, width, height);",
                  "  display.drawImage(bitmap, rotatedX, rotatedY, width, height);",
                  "offscreen image B: byte 401 expected A5, actual 00"),
+            ]
+            mutants += [
+                ("misreport legacy snapshot", "out.kind = uiGrayEnabled_ ? SnapshotKind::RetainedTuple : SnapshotKind::LegacyBw;",
+                 "out.kind = SnapshotKind::RetainedTuple;", "legacy capture truthfully reports BW: expected true, actual false"),
+                ("skip snapshot capacity", "if (storage.capacity < layout.totalBytes) return FrameResult::ShortCapacity;",
+                 "if (false) return FrameResult::ShortCapacity;", "capture short capacity rejected: expected true, actual false"),
+                ("accept snapshot offset alias", "if (addressRangesOverlap(storage.data, layout.totalBytes, sources[plane], frameBufferSize))",
+                 "if (storage.data == sources[plane])", "capture offset alias rejected: expected true, actual false"),
+                ("unsafe snapshot geometry",
+                 "if (x0 >= x1 || y0 >= y1) return {}; SnapshotLayout layout; layout.rect = screenRectToAlignedMemRect(orientation, x0, y0, x1 - x0, y1 - y0, panelWidth, panelHeight);",
+                 "SnapshotLayout layout; layout.rect = screenRectToAlignedMemRect(orientation, x, y, width, height, panelWidth, panelHeight);",
+                 "wide endpoint clipping remains visible: expected true, actual false"),
+                ("publish cancelled capture", "if (accountCancellation()) return FrameResult::Cancelled; const GrayFrame::Plane b",
+                 "const GrayFrame::Plane b", "late capture abort invalidates descriptor: expected true, actual false"),
             ]
             for name, original, replacement, expected_error in mutants:
                 pattern = r"\s+".join(re.escape(part) for part in original.split())

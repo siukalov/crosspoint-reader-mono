@@ -434,6 +434,53 @@ static AlignedMemRect screenRectToAlignedMemRect(GfxRenderer::Orientation orient
 
 enum class TextRotation { None, Rotated90CW };
 
+namespace {
+struct SnapshotLayout {
+  AlignedMemRect rect;
+  size_t rowBytes = 0;
+  size_t planeBytes = 0;
+  size_t totalBytes = 0;
+};
+
+SnapshotLayout snapshotLayout(GfxRenderer::Orientation orientation, int x, int y, int width, int height,
+                              uint16_t panelWidth, uint16_t panelHeight, uint16_t panelStride, size_t planeCount) {
+  if (width <= 0 || height <= 0 || !panelWidth || !panelHeight ||
+      panelStride < (static_cast<size_t>(panelWidth) + 7) / 8)
+    return {};
+  const bool portrait = orientation == GfxRenderer::Portrait || orientation == GfxRenderer::PortraitInverted;
+  if (!portrait && orientation != GfxRenderer::LandscapeClockwise &&
+      orientation != GfxRenderer::LandscapeCounterClockwise)
+    return {};
+  const int64_t logicalWidth = portrait ? panelHeight : panelWidth;
+  const int64_t logicalHeight = portrait ? panelWidth : panelHeight;
+  const int64_t x0 = std::max<int64_t>(0, x);
+  const int64_t y0 = std::max<int64_t>(0, y);
+  const int64_t x1 = std::min<int64_t>(logicalWidth, static_cast<int64_t>(x) + width);
+  const int64_t y1 = std::min<int64_t>(logicalHeight, static_cast<int64_t>(y) + height);
+  if (x0 >= x1 || y0 >= y1) return {};
+  SnapshotLayout layout;
+  layout.rect = screenRectToAlignedMemRect(orientation, x0, y0, x1 - x0, y1 - y0, panelWidth, panelHeight);
+  if (!layout.rect.valid) return {};
+  layout.rowBytes = (static_cast<size_t>(layout.rect.w) + 7) / 8;
+  if (layout.rect.x == 0 && layout.rect.w == panelWidth) layout.rowBytes = panelStride;
+  if (layout.rowBytes > std::numeric_limits<size_t>::max() / layout.rect.h) return {};
+  layout.planeBytes = layout.rowBytes * layout.rect.h;
+  if (layout.planeBytes > std::numeric_limits<size_t>::max() / planeCount) return {};
+  layout.totalBytes = layout.planeBytes * planeCount;
+  return layout;
+}
+
+bool addressRangeFits(const uint8_t* data, size_t bytes) {
+  return data && bytes <= std::numeric_limits<uintptr_t>::max() - reinterpret_cast<uintptr_t>(data);
+}
+
+bool addressRangesOverlap(const uint8_t* first, size_t firstBytes, const uint8_t* second, size_t secondBytes) {
+  const auto firstAddress = reinterpret_cast<uintptr_t>(first);
+  const auto secondAddress = reinterpret_cast<uintptr_t>(second);
+  return firstAddress < secondAddress + secondBytes && secondAddress < firstAddress + firstBytes;
+}
+}  // namespace
+
 static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
                              const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
                              const bool pixelState, const EpdFontFamily::Style style) {
@@ -1826,6 +1873,68 @@ void GfxRenderer::runDisplayMaintenance() const {
 bool GfxRenderer::hasPendingDisplayMaintenance() const { return display.hasPendingMaintenance(); }
 
 void GfxRenderer::displayControllerIdle() const { display.controllerIdle(); }
+
+size_t GfxRenderer::regionSnapshotBytes(int x, int y, int width, int height) const {
+  return snapshotLayout(orientation, x, y, width, height, panelWidth, panelHeight, panelWidthBytes,
+                        uiGrayEnabled_ ? 3 : 1)
+      .totalBytes;
+}
+
+size_t GfxRenderer::frameSnapshotBytes() const {
+  return regionSnapshotBytes(0, 0, getScreenWidth(), getScreenHeight());
+}
+
+GfxRenderer::FrameResult GfxRenderer::captureRegion(int x, int y, int width, int height, GrayFrame::Plane storage,
+                                                    FrameSnapshot& out) const {
+  out.valid = false;
+  if (!frameBuffer || target_.strip || target_.owner != FrameOwner::LiveUi) return FrameResult::Unavailable;
+  if (accountCancellation()) return FrameResult::Cancelled;
+  if (!liveCoherent_) return FrameResult::InvalidLive;
+
+  const size_t planeCount = uiGrayEnabled_ ? 3 : 1;
+  const auto layout =
+      snapshotLayout(orientation, x, y, width, height, panelWidth, panelHeight, panelWidthBytes, planeCount);
+  if (!layout.totalBytes || !addressRangeFits(storage.data, layout.totalBytes)) return FrameResult::InvalidSource;
+  if (storage.capacity < layout.totalBytes) return FrameResult::ShortCapacity;
+
+  const size_t sourceOffset = static_cast<size_t>(layout.rect.y) * panelWidthBytes + layout.rect.x / 8;
+  const size_t sourceBytes = static_cast<size_t>(layout.rect.h - 1) * panelWidthBytes + layout.rowBytes;
+  if (sourceOffset > frameBufferSize || sourceBytes > frameBufferSize - sourceOffset) return FrameResult::InvalidLive;
+  const uint8_t* sources[] = {frameBuffer, liveL_, liveM_};
+  for (size_t plane = 0; plane < 3; ++plane) {
+    if (!sources[plane] && plane >= planeCount) continue;
+    if (!addressRangeFits(sources[plane], frameBufferSize)) return FrameResult::InvalidLive;
+    if (addressRangesOverlap(storage.data, layout.totalBytes, sources[plane], frameBufferSize))
+      return FrameResult::InvalidSource;
+  }
+  for (size_t plane = 0; plane < planeCount; ++plane) {
+    for (size_t row = 0; row < layout.rect.h; ++row) {
+      memcpy(storage.data + plane * layout.planeBytes + row * layout.rowBytes,
+             sources[plane] + sourceOffset + row * panelWidthBytes, layout.rowBytes);
+    }
+  }
+  if (accountCancellation()) return FrameResult::Cancelled;
+
+  const GrayFrame::Plane b{storage.data, layout.planeBytes};
+  const GrayFrame::Plane l =
+      uiGrayEnabled_ ? GrayFrame::Plane{storage.data + layout.planeBytes, layout.planeBytes} : GrayFrame::Plane{};
+  const GrayFrame::Plane m =
+      uiGrayEnabled_ ? GrayFrame::Plane{storage.data + 2 * layout.planeBytes, layout.planeBytes} : GrayFrame::Plane{};
+  out.planes = GrayFrame(b, l, m, layout.rect.w, layout.rect.h, layout.rowBytes, layout.rect.y);
+  out.physicalByteX = layout.rect.x / 8;
+  out.panelWidth = panelWidth;
+  out.panelHeight = panelHeight;
+  out.panelStride = panelWidthBytes;
+  out.orientation = orientation;
+  out.kind = uiGrayEnabled_ ? SnapshotKind::RetainedTuple : SnapshotKind::LegacyBw;
+  out.restoreEpoch = restoreEpoch_;
+  out.valid = true;
+  return FrameResult::Ok;
+}
+
+GfxRenderer::FrameResult GfxRenderer::captureFrame(GrayFrame::Plane storage, FrameSnapshot& out) const {
+  return captureRegion(0, 0, getScreenWidth(), getScreenHeight(), storage, out);
+}
 
 size_t GfxRenderer::readFramebufferRegion(int x, int y, int w, int h, uint8_t* dst, size_t dstCapacity) const {
   if (!canCaptureLiveFrame() || dst == nullptr || w <= 0 || h <= 0) return 0;
