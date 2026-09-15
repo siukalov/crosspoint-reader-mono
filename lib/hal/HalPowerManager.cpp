@@ -140,10 +140,9 @@ void HalPowerManager::pollBattery() const {
     // low-pass first. Gauge and PMIC boards report an already-averaged figure.
     const bool rawAdc = BoardConfig::ACTIVE.batteryGauge.gaugeAddr == 0 && !BoardConfig::isM5StackPaperColor() &&
                         !BoardConfig::isPaperMono();
-    _batteryCachedMillivolts =
-        (!rawAdc || _batteryCachedMillivolts == 0)
-            ? status.millivolts
-            : static_cast<uint16_t>((_batteryCachedMillivolts * 3u + status.millivolts) / 4u);
+    _batteryCachedMillivolts = (!rawAdc || _batteryCachedMillivolts == 0)
+                                   ? status.millivolts
+                                   : static_cast<uint16_t>((_batteryCachedMillivolts * 3u + status.millivolts) / 4u);
   }
 
   if (BoardConfig::ACTIVE.batteryGauge.gaugeAddr != 0) {
