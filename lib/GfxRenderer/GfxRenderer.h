@@ -293,8 +293,7 @@ class GfxRenderer {
   int getFontAscenderSize(int fontId) const;
   int getLineHeight(int fontId) const;
   int getLineHeight(int fontId, float compression) const;
-  int getLineHeightForText(int fontId, const char* text,
-                           EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  int getLineHeightForText(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   std::string truncatedText(int fontId, const char* text, int maxWidth,
                             EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   std::vector<std::string> wrappedText(int fontId, const char* text, int maxWidth, int maxLines,

@@ -19,12 +19,21 @@ uint8_t resolveSdCardStyle(const SdCardFont& font, const EpdFontFamily::Style st
   return font.resolveStyle(static_cast<uint8_t>(style));
 }
 
-constexpr uint8_t AA_GRAY_LOW = 32;   // below this the pixel stays background
+constexpr uint8_t AA_GRAY_LOW = 32;  // below this the pixel stays background
 constexpr uint8_t AA_GRAY_HIGH = 128;
-constexpr uint8_t AA_BLACK = 224;     // at or above this the pixel renders black
+constexpr uint8_t AA_BLACK = 224;  // at or above this the pixel renders black
 
 constexpr uint8_t quantiseCoverage(const uint8_t alpha) {
   return alpha < AA_GRAY_LOW ? 0 : alpha < AA_GRAY_HIGH ? 1 : alpha < AA_BLACK ? 2 : 3;
+}
+
+bool collectGlyphCoverage(const GfxRenderer& renderer, const int x, const int y, const uint8_t coverage,
+                          const bool blackInk) {
+  if (renderer.isFontCacheScanning()) return true;
+  if (!renderer.coverageEnabled()) return false;
+  // A bound coverage target must not fall through after a rejected write.
+  renderer.drawCoverage(x, y, coverage, blackInk);
+  return true;
 }
 }  // namespace
 
@@ -457,50 +466,50 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
         }
         const uint8_t alpha = static_cast<uint8_t>((coverage + samples / 2) / samples);
         const uint8_t raw = quantiseCoverage(alpha);
-        if ((renderMode == GfxRenderer::BW && raw >= 2) ||
-            (renderMode == GfxRenderer::BW_GRAY_BASE && raw >= 2)) {
+        if (collectGlyphCoverage(renderer, baseX + dstX, baseY + dstY, raw, pixelState)) continue;
+        if ((renderMode == GfxRenderer::BW && raw >= 2) || (renderMode == GfxRenderer::BW_GRAY_BASE && raw >= 2)) {
           renderer.drawPixel(baseX + dstX, baseY + dstY, pixelState);
         } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (raw == 1 || raw == 2)) {
           renderer.drawPixel(baseX + dstX, baseY + dstY, false);
-          } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && raw == 2) {
-            renderer.drawPixel(baseX + dstX, baseY + dstY, false);
-          } else if (renderMode == GfxRenderer::GRAYSCALE_BOTH && (raw == 1 || raw == 2)) {
-            renderer.drawGrayPixel(baseX + dstX, baseY + dstY, raw == 2, true);
-          }
+        } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && raw == 2) {
+          renderer.drawPixel(baseX + dstX, baseY + dstY, false);
+        } else if (renderMode == GfxRenderer::GRAYSCALE_BOTH && (raw == 1 || raw == 2)) {
+          renderer.drawGrayPixel(baseX + dstX, baseY + dstY, raw == 2, true);
+        }
       }
     }
   } else if (fontData->is2Bit) {
     for (int dstY = 0; dstY < dstH; dstY++) {
       const int srcY = dstY * 2;
       for (int dstX = 0; dstX < dstW; dstX++) {
-      const int srcX = dstX * 2;
-      uint8_t coverage = 0;
-      uint8_t samples = 0;
-      for (int sampleY = 0; sampleY < 2 && srcY + sampleY < srcH; sampleY++) {
-        for (int sampleX = 0; sampleX < 2 && srcX + sampleX < srcW; sampleX++) {
-          const int pos = (srcY + sampleY) * srcW + srcX + sampleX;
-          const uint8_t byte = bitmap[pos >> 2];
-          const uint8_t raw = (byte >> ((3 - (pos & 3)) * 2)) & 0x3;
-          coverage += raw;
-          ++samples;
+        const int srcX = dstX * 2;
+        uint8_t coverage = 0;
+        uint8_t samples = 0;
+        for (int sampleY = 0; sampleY < 2 && srcY + sampleY < srcH; sampleY++) {
+          for (int sampleX = 0; sampleX < 2 && srcX + sampleX < srcW; sampleX++) {
+            const int pos = (srcY + sampleY) * srcW + srcX + sampleX;
+            const uint8_t byte = bitmap[pos >> 2];
+            const uint8_t raw = (byte >> ((3 - (pos & 3)) * 2)) & 0x3;
+            coverage += raw;
+            ++samples;
+          }
         }
-      }
 
-      uint8_t raw = 0;
-      if (coverage > 0) {
-        const uint8_t average = static_cast<uint8_t>((coverage + samples / 2) / samples);
-        raw = static_cast<uint8_t>(std::min<int>(3, average + (coverage >= 3 ? 1 : 0)));
-      }
-      if ((renderMode == GfxRenderer::BW && raw > 0) ||
-          (renderMode == GfxRenderer::BW_GRAY_BASE && raw >= 2)) {
-        renderer.drawPixel(baseX + dstX, baseY + dstY, pixelState);
-      } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (raw == 1 || raw == 2)) {
-        renderer.drawPixel(baseX + dstX, baseY + dstY, false);
-      } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && raw == 2) {
-        renderer.drawPixel(baseX + dstX, baseY + dstY, false);
-      } else if (renderMode == GfxRenderer::GRAYSCALE_BOTH && (raw == 1 || raw == 2)) {
-        renderer.drawGrayPixel(baseX + dstX, baseY + dstY, raw == 2, true);
-      }
+        uint8_t raw = 0;
+        if (coverage > 0) {
+          const uint8_t average = static_cast<uint8_t>((coverage + samples / 2) / samples);
+          raw = static_cast<uint8_t>(std::min<int>(3, average + (coverage >= 3 ? 1 : 0)));
+        }
+        if (collectGlyphCoverage(renderer, baseX + dstX, baseY + dstY, raw, pixelState)) continue;
+        if ((renderMode == GfxRenderer::BW && raw > 0) || (renderMode == GfxRenderer::BW_GRAY_BASE && raw >= 2)) {
+          renderer.drawPixel(baseX + dstX, baseY + dstY, pixelState);
+        } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (raw == 1 || raw == 2)) {
+          renderer.drawPixel(baseX + dstX, baseY + dstY, false);
+        } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && raw == 2) {
+          renderer.drawPixel(baseX + dstX, baseY + dstY, false);
+        } else if (renderMode == GfxRenderer::GRAYSCALE_BOTH && (raw == 1 || raw == 2)) {
+          renderer.drawGrayPixel(baseX + dstX, baseY + dstY, raw == 2, true);
+        }
       }
     }
   } else {
@@ -519,7 +528,7 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
             }
           }
         }
-        if (hasInk) {
+        if (hasInk && !collectGlyphCoverage(renderer, baseX + dstX, baseY + dstY, 3, pixelState)) {
           renderer.drawPixel(baseX + dstX, baseY + dstY, pixelState);
         }
       }
@@ -587,8 +596,8 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
 
           const uint8_t alpha = bitmap[pixelPosition];
           const uint8_t raw = quantiseCoverage(alpha);
-          if ((renderMode == GfxRenderer::BW && raw >= 2) ||
-              (renderMode == GfxRenderer::BW_GRAY_BASE && raw >= 2)) {
+          if (collectGlyphCoverage(renderer, screenX, screenY, raw, pixelState)) continue;
+          if ((renderMode == GfxRenderer::BW && raw >= 2) || (renderMode == GfxRenderer::BW_GRAY_BASE && raw >= 2)) {
             renderer.drawPixel(screenX, screenY, pixelState);
           } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (raw == 1 || raw == 2)) {
             renderer.drawPixel(screenX, screenY, false);
@@ -616,6 +625,7 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
           const uint8_t byte = bitmap[pixelPosition >> 2];
           const uint8_t bit_index = (3 - (pixelPosition & 3)) * 2;
           const uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
+          if (collectGlyphCoverage(renderer, screenX, screenY, 3 - bmpVal, pixelState)) continue;
 
           if ((renderMode == GfxRenderer::BW && bmpVal < 3) ||
               (renderMode == GfxRenderer::BW_GRAY_BASE && bmpVal < 2)) {
@@ -646,7 +656,7 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
           const uint8_t byte = bitmap[pixelPosition >> 3];
           const uint8_t bit_index = 7 - (pixelPosition & 7);
 
-          if ((byte >> bit_index) & 1) {
+          if (((byte >> bit_index) & 1) && !collectGlyphCoverage(renderer, screenX, screenY, 3, pixelState)) {
             renderer.drawPixel(screenX, screenY, pixelState);
           }
         }
@@ -2148,8 +2158,7 @@ int GfxRenderer::getLineHeight(const int fontId, const float compression) const 
   return static_cast<int>(getLineHeight(fontId) * compression + 0.5f);
 }
 
-int GfxRenderer::getLineHeightForText(const int fontId, const char* text,
-                                      const EpdFontFamily::Style style) const {
+int GfxRenderer::getLineHeightForText(const int fontId, const char* text, const EpdFontFamily::Style style) const {
   return getLineHeight(resolveTextFontId(fontId, text, style));
 }
 

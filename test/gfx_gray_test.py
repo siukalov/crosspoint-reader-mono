@@ -96,6 +96,8 @@ HARNESS = r"""
 #include <GfxRenderer.h>
 #include <DirectPixelWriter.h>
 #include <EpdFont.h>
+#include <FontCacheManager.h>
+#include <FontDecompressor.h>
 #include <esp_heap_caps.h>
 
 static std::array<uint8_t, 48000> physical;
@@ -530,6 +532,275 @@ static void testReaderImport(GfxRenderer& renderer) {
   require(submissions == binaryBefore + 1 && graySubmissions == before + 1, "AA off UI submits BW only");
 }
 
+struct GlyphFixture {
+  GfxRenderer& renderer;
+  int id;
+  EpdGlyph glyph{};
+  EpdUnicodeInterval interval{};
+  EpdFontData data{};
+  EpdFont font{&data};
+
+  GlyphFixture(GfxRenderer& r, int fontId, const uint8_t* bitmap, uint8_t width, uint8_t height, uint8_t bpp,
+               uint32_t codepoint = 65)
+      : renderer(r), id(fontId) {
+    glyph.width = width;
+    glyph.height = height;
+    glyph.advanceX = width * 16;
+    glyph.dataLength = (width * height * bpp + 7) / 8;
+    interval = {codepoint, codepoint, 0};
+    data.bitmap = bitmap;
+    data.glyph = &glyph;
+    data.intervals = &interval;
+    data.intervalCount = 1;
+    data.advanceY = height + 1;
+    data.is2Bit = bpp == 2;
+    data.glyphBitmapBpp = bpp == 8 ? 8 : 0;
+    renderer.insertFont(id, EpdFontFamily(&font));
+  }
+  ~GlyphFixture() { renderer.removeFont(id); }
+};
+
+static void expectGlyphByte(const GfxRenderer& renderer, size_t offset, uint8_t b, uint8_t l, uint8_t m,
+                            const char* name) {
+  expect(physical.data() + offset, &b, 1, (std::string(name) + " B").c_str());
+  expect(renderer.getLiveGrayPlane(true) + offset, &l, 1, (std::string(name) + " L").c_str());
+  expect(renderer.getLiveGrayPlane(false) + offset, &m, 1, (std::string(name) + " M").c_str());
+}
+
+static void expectGlyphPixel(const GfxRenderer& renderer, int px, int py, uint8_t darkness, const char* name) {
+  const uint8_t canonical[][3] = {{1, 0, 0}, {1, 0, 1}, {0, 1, 1}, {0, 0, 0}};
+  const size_t offset = py * 100 + px / 8;
+  const uint8_t mask = 0x80 >> (px % 8);
+  const uint8_t actual[] = {uint8_t((physical[offset] & mask) != 0),
+                            uint8_t((renderer.getLiveGrayPlane(true)[offset] & mask) != 0),
+                            uint8_t((renderer.getLiveGrayPlane(false)[offset] & mask) != 0)};
+  expect(actual, canonical[darkness], 3, name);
+}
+
+static void testPackedGlyphs(GfxRenderer& renderer) {
+  const uint8_t packed[] = {0x1B};
+  GlyphFixture font(renderer, 100, packed, 4, 1, 2);
+  renderer.clearScreen();
+  renderer.drawText(100, 0, 0, "A");
+  expectGlyphByte(renderer, 0, 0xCF, 0x20, 0x60, "glyph packed");
+  renderer.drawText(100, 0, 0, "A");
+  expectGlyphByte(renderer, 0, 0x8F, 0x40, 0x40, "glyph overlap");
+  renderer.drawText(100, 0, 0, "A", false);
+  expectGlyphByte(renderer, 0, 0xFF, 0, 0x60, "glyph overlap white");
+  renderer.clearScreen(0);
+  renderer.drawText(100, 0, 0, "A", false);
+  expectGlyphByte(renderer, 0, 0x30, 0x40, 0x60, "glyph white on black");
+  renderer.clearScreen();
+  require(renderer.drawCoverage(0, 0, 1), "seed glyph transparency");
+  renderer.drawText(100, 0, 0, "A");
+  expectGlyphByte(renderer, 0, 0xCF, 0x20, 0xE0, "glyph zero preserves destination");
+  require(renderer.getTextAdvanceX(100, "AA", EpdFontFamily::REGULAR) == 8, "glyph advances unchanged");
+  renderer.clearScreen();
+  renderer.drawText(100, 0, 1, "A", true, EpdFontFamily::BOLD);
+  expectGlyphByte(renderer, 100, 0xCF, 0x20, 0x60, "glyph missing style fallback");
+}
+
+static const uint8_t* alphaBitmap(void* context, const EpdGlyph*) { return static_cast<const uint8_t*>(context); }
+
+static void testAlphaAndBinaryGlyphs(GfxRenderer& renderer) {
+  const uint8_t alpha[] = {31, 32, 127, 128, 223, 224};
+  GlyphFixture font(renderer, 101, nullptr, 6, 1, 8);
+  font.data.glyphMissCtx = const_cast<uint8_t*>(alpha);
+  font.data.glyphBitmapHandler = alphaBitmap;
+  renderer.clearScreen();
+  renderer.drawText(101, 0, 0, "A");
+  expectGlyphByte(renderer, 0, 0xE3, 0x18, 0x78, "glyph alpha thresholds");
+  renderer.clearScreen(0);
+  renderer.drawText(101, 0, 0, "A", false);
+  expectGlyphByte(renderer, 0, 0x1C, 0x60, 0x78, "glyph alpha white");
+  const uint8_t binary[] = {0x50};
+  GlyphFixture mono(renderer, 102, binary, 4, 1, 1);
+  renderer.clearScreen();
+  require(renderer.drawCoverage(0, 0, 2) && renderer.drawCoverage(1, 0, 2), "seed binary overwrite");
+  renderer.drawText(102, 0, 0, "A");
+  expectGlyphByte(renderer, 0, 0x2F, 0x80, 0x80, "glyph binary clears painted selectors");
+  renderer.drawText(102, 0, 0, "A", false);
+  expectGlyphByte(renderer, 0, 0x7F, 0x80, 0x80, "glyph binary white preserves skipped shade");
+}
+
+static void testDecodedAndFallbackGlyphs(GfxRenderer& renderer) {
+  FontDecompressor decoder;
+  require(decoder.init(), "glyph decoder initialized");
+  FontCacheManager cache(renderer.getFontMap(), renderer.getSdCardFonts());
+  cache.setFontDecompressor(&decoder);
+  renderer.setFontCacheManager(&cache);
+  const uint8_t compressed[] = {0x93, 0x06, 0x00};
+  GlyphFixture font(renderer, 103, compressed, 4, 1, 2);
+  const EpdFontGroup group{0, 3, 1, 1, 0};
+  font.data.groups = &group;
+  font.data.groupCount = 1;
+  renderer.clearScreen();
+  renderer.drawText(103, 0, 0, "A");
+  expectGlyphByte(renderer, 0, 0xCF, 0x20, 0x60, "glyph real DEFLATE");
+  cache.prewarmCache(103, "A");
+  renderer.drawText(103, 0, 1, "A");
+  expectGlyphByte(renderer, 100, 0xCF, 0x20, 0x60, "glyph decompressor page cache");
+  const uint8_t packed[] = {0x1B};
+  GlyphFixture cjk(renderer, 104, packed, 4, 1, 2, 0x4E00);
+  renderer.setFallbackFont(103, 104);
+  renderer.drawText(103, 0, 2, "\xE4\xB8\x80");
+  expectGlyphByte(renderer, 200, 0xCF, 0x20, 0x60, "glyph CJK font fallback");
+  GlyphFixture replacement(renderer, 105, packed, 4, 1, 2, 0xFFFD);
+  renderer.drawText(105, 0, 3, "?");
+  expectGlyphByte(renderer, 300, 0xCF, 0x20, 0x60, "glyph replacement fallback");
+  renderer.clearFallbackFonts();
+  renderer.setFontCacheManager(nullptr);
+}
+
+static void testHalfSizeGlyphs(GfxRenderer& renderer) {
+  const uint8_t packed[] = {0x03};
+  const uint8_t alpha[] = {0, 0, 0, 255};
+  const uint8_t binary[] = {0x10};
+  GlyphFixture two(renderer, 106, packed, 2, 2, 2);
+  GlyphFixture eight(renderer, 107, alpha, 2, 2, 8);
+  GlyphFixture one(renderer, 108, binary, 2, 2, 1);
+  renderer.clearScreen();
+  renderer.drawText(106, 0, 0, "A", true, EpdFontFamily::SUP);
+  expectGlyphByte(renderer, 0, 0x7F, 0x80, 0x80, "glyph half packed boost");
+  renderer.drawText(107, 0, 1, "A", true, EpdFontFamily::SUB);
+  expectGlyphByte(renderer, 100, 0xFF, 0, 0x80, "glyph half alpha average");
+  renderer.drawText(108, 0, 2, "A", true, EpdFontFamily::SUP);
+  expectGlyphByte(renderer, 200, 0x7F, 0, 0, "glyph half binary sample");
+  require(renderer.getTextAdvanceX(106, "AA", EpdFontFamily::SUP) == 2, "half glyph advances unchanged");
+  renderer.clearScreen(0);
+  renderer.drawText(106, 0, 0, "A", false, EpdFontFamily::SUP);
+  expectGlyphByte(renderer, 0, 0x80, 0, 0x80, "glyph half white packed");
+  renderer.drawText(107, 0, 1, "A", false, EpdFontFamily::SUB);
+  expectGlyphByte(renderer, 100, 0, 0x80, 0x80, "glyph half white alpha");
+}
+
+static void testOddAndRotatedGlyphs(GfxRenderer& renderer) {
+  const uint8_t packed[] = {0x0C, 0x0C, 0x40};
+  const uint8_t alpha[] = {0, 0, 255, 0, 0, 0, 255, 0, 127};
+  GlyphFixture two(renderer, 109, packed, 3, 3, 2);
+  GlyphFixture eight(renderer, 110, alpha, 3, 3, 8);
+  renderer.clearScreen();
+  renderer.drawText(109, 0, 0, "A", true, EpdFontFamily::SUP);
+  expectGlyphByte(renderer, 0, 0xBF, 0, 0, "glyph odd packed row zero");
+  expectGlyphByte(renderer, 100, 0x7F, 0, 0x40, "glyph odd packed row one");
+  renderer.drawText(110, 0, 2, "A", true, EpdFontFamily::SUB);
+  expectGlyphByte(renderer, 200, 0xBF, 0x40, 0x40, "glyph odd alpha row zero");
+  expectGlyphByte(renderer, 300, 0x7F, 0x80, 0xC0, "glyph odd alpha row one");
+  renderer.setOrientation(GfxRenderer::Portrait);
+  renderer.clearScreen();
+  renderer.drawText(110, 1, 2, "A", true, EpdFontFamily::SUP);
+  expectGlyphPixel(renderer, 2, 477, 2, "glyph odd portrait upper pixel");
+  expectGlyphPixel(renderer, 3, 478, 2, "glyph odd portrait lower pixel");
+  expectGlyphPixel(renderer, 3, 477, 1, "glyph odd portrait corner pixel");
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+}
+
+static void testGlyphRotation(GfxRenderer& renderer) {
+  const uint8_t packed[] = {0x1B};
+  GlyphFixture font(renderer, 111, packed, 4, 1, 2);
+  const GfxRenderer::Orientation orientations[] = {GfxRenderer::Portrait, GfxRenderer::PortraitInverted,
+                                                   GfxRenderer::LandscapeClockwise,
+                                                   GfxRenderer::LandscapeCounterClockwise};
+  const int physicalGray[][2] = {{2, 477}, {797, 2}, {797, 477}, {2, 2}};
+  for (size_t i = 0; i < 4; ++i) {
+    renderer.setOrientation(orientations[i]);
+    renderer.clearScreen();
+    renderer.drawText(111, 1, 2, "A");
+    expectGlyphPixel(renderer, physicalGray[i][0], physicalGray[i][1], 1, "glyph orientation literal pixel");
+  }
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  renderer.clearScreen();
+  renderer.drawTextRotated90CW(111, 10, 10, "A");
+  expectGlyphPixel(renderer, 10, 10, 0, "glyph rotated transparent");
+  expectGlyphPixel(renderer, 10, 9, 1, "glyph rotated light");
+  expectGlyphPixel(renderer, 10, 8, 2, "glyph rotated dark");
+  expectGlyphPixel(renderer, 10, 7, 3, "glyph rotated black");
+  const uint8_t alpha[] = {31, 32, 127, 128, 223, 224};
+  const uint8_t shades[] = {0, 1, 1, 2, 2, 3};
+  GlyphFixture eight(renderer, 115, alpha, 6, 1, 8);
+  renderer.drawTextRotated90CW(115, 20, 20, "A");
+  for (int i = 0; i < 6; ++i) {
+    expectGlyphPixel(renderer, 20, 20 - i, shades[i], "glyph rotated alpha thresholds");
+  }
+  const uint8_t binary[] = {0x50};
+  GlyphFixture one(renderer, 116, binary, 4, 1, 1);
+  renderer.drawTextRotated90CW(116, 30, 30, "A");
+  expectGlyphPixel(renderer, 30, 30, 0, "glyph rotated binary transparent");
+  expectGlyphPixel(renderer, 30, 29, 3, "glyph rotated binary first ink");
+  expectGlyphPixel(renderer, 30, 28, 0, "glyph rotated binary gap");
+  expectGlyphPixel(renderer, 30, 27, 3, "glyph rotated binary second ink");
+}
+
+static void testLegacyGlyphs(GfxRenderer& renderer) {
+  const uint8_t packed[] = {0x1B};
+  const uint8_t alpha[] = {31, 32, 127, 128, 223, 224};
+  GlyphFixture two(renderer, 112, packed, 4, 1, 2);
+  GlyphFixture eight(renderer, 113, alpha, 6, 1, 8);
+  renderer.setCoveragePolicy(GfxRenderer::CoveragePolicy::Suspend);
+  renderer.setRenderMode(GfxRenderer::BW);
+  renderer.clearScreen();
+  renderer.drawText(112, 0, 0, "A");
+  renderer.drawText(113, 0, 1, "A");
+  require(physical[0] == 0x8F && physical[100] == 0xE3, "legacy packed and alpha BW thresholds");
+  renderer.setRenderMode(GfxRenderer::BW_GRAY_BASE);
+  renderer.clearScreen();
+  renderer.drawText(112, 0, 0, "A");
+  require(physical[0] == 0xCF, "legacy packed gray base threshold");
+  std::array<uint8_t, 100> l{}, m{};
+  renderer.beginDualStripTarget(l.data(), m.data(), 0, 1);
+  renderer.setRenderMode(GfxRenderer::GRAYSCALE_BOTH);
+  renderer.drawText(112, 0, 0, "A");
+  require(l[0] == 0x20 && m[0] == 0x60, "legacy packed dual selectors");
+  l.fill(0);
+  m.fill(0);
+  renderer.drawText(113, 0, 0, "A");
+  require(l[0] == 0x18 && m[0] == 0x78, "legacy alpha dual selectors");
+  renderer.endStripTarget();
+  renderer.setRenderMode(GfxRenderer::BW);
+  renderer.setCoveragePolicy(GfxRenderer::CoveragePolicy::Collect);
+}
+
+static void testGlyphScan(GfxRenderer& renderer) {
+  const uint8_t packed[] = {0x1B};
+  GlyphFixture font(renderer, 114, packed, 4, 1, 2);
+  FontCacheManager cache(renderer.getFontMap(), renderer.getSdCardFonts());
+  renderer.setFontCacheManager(&cache);
+  renderer.clearScreen();
+  require(renderer.drawCoverage(0, 0, 2), "scan marker");
+  std::array<uint8_t, 48000> b = physical, l{}, m{};
+  std::memcpy(l.data(), renderer.getLiveGrayPlane(true), l.size());
+  std::memcpy(m.data(), renderer.getLiveGrayPlane(false), m.size());
+  {
+    auto scan = cache.createPrewarmScope();
+    renderer.drawText(114, 0, 0, "A");
+    renderer.drawText(114, 0, 1, "A", true, EpdFontFamily::SUP);
+    renderer.drawTextRotated90CW(114, 10, 10, "A");
+    renderer.setCoveragePolicy(GfxRenderer::CoveragePolicy::Suspend);
+    renderer.drawTextRotated90CW(114, 20, 20, "A");
+  }
+  expect(physical.data(), b.data(), b.size(), "glyph scan preserves B");
+  expect(renderer.getLiveGrayPlane(true), l.data(), l.size(), "glyph scan preserves L");
+  expect(renderer.getLiveGrayPlane(false), m.data(), m.size(), "glyph scan preserves M");
+  renderer.setCoveragePolicy(GfxRenderer::CoveragePolicy::Collect);
+  renderer.setFontCacheManager(nullptr);
+}
+
+static void testGlyphCoverage(HalDisplay& hal) {
+  GfxRenderer renderer(hal);
+  renderer.begin();
+  renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  require(renderer.setUiGrayEnabled(true), "glyph tuple allocation");
+  testPackedGlyphs(renderer);
+  testAlphaAndBinaryGlyphs(renderer);
+  testDecodedAndFallbackGlyphs(renderer);
+  testHalfSizeGlyphs(renderer);
+  testOddAndRotatedGlyphs(renderer);
+  testGlyphRotation(renderer);
+  testLegacyGlyphs(renderer);
+  testGlyphScan(renderer);
+}
+
 int main() {
   HalDisplay hal;
   {
@@ -603,7 +874,8 @@ int main() {
   testOwnership(hal, renderer);
   testUiSubmission(renderer);
   testReaderImport(renderer);
-  std::puts("PASS: actual renderer binding, ownership, clipped reader imports, B restoration, gray submission, cancellation and fallback");
+  testGlyphCoverage(hal);
+  std::puts("PASS: actual renderer ownership, submission, imports, glyph coverage, font decoding, rotation and scan controls");
   }
   require(liveAllocations == 0, "renderer destruction releases pair");
 }
@@ -871,6 +1143,10 @@ class RendererSeamTest(unittest.TestCase):
                  "bool GfxRenderer::finishReaderImport() const {\n  if (target_.owner != FrameOwner::ReaderScratch) return false;", "cancelled reader import rejected: expected true, actual false"),
                 ("omit gray submission", "  if (!accountCancellation()) display.displayGrayBuffer(fadingFix);\n  return true;",
                  "  return true;", "UI marker submits exactly one gray frame: expected true, actual false"),
+                ("skip glyph collector", "  renderer.drawCoverage(x, y, coverage, blackInk);", "",
+                 "glyph packed B: byte 0 expected CF, actual FF"),
+                ("glyph scan writes", "  if (renderer.isFontCacheScanning()) return true;", "",
+                 "glyph scan preserves B: byte 1702 expected FF, actual F7"),
             ]
             for name, original, replacement, expected_error in mutants:
                 pattern = r"\s+".join(re.escape(part) for part in original.split())
