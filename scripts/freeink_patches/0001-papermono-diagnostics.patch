@@ -1,0 +1,58 @@
+diff --git a/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp b/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp
+index c79227b..a7e083a 100644
+--- a/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp
++++ b/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp
+@@ -7,6 +7,12 @@
+ #include <array>
+ #include <cstring>
+ 
++extern "C" bool freeink_panel_capture_enabled() __attribute__((weak));
++extern "C" void freeink_panel_capture_plane(uint8_t command, uint32_t generation, uint16_t width, uint16_t height,
++                                            uint32_t offset, const uint8_t* data, uint16_t count) __attribute__((weak));
++extern "C" void freeink_panel_capture_activation(uint8_t control, uint32_t generation, uint32_t busyMs)
++    __attribute__((weak));
++
+ #if FREEINK_WAVEFORM_LAB && __has_include("PaperMonoWaveformBaked.h")
+ // Optional waveform-editor export ("bake"): defines PAPER_MONO_WAVEFORM_BAKED_PAGE
+ // and optionally _CORRECTIVE/_STAGE2 as uint8_t[111] arrays. The baked set
+@@ -373,32 +379,37 @@ void Ssd1683Driver::resetRamCounter(EpdBus& bus) {
+ 
+ void Ssd1683Driver::writePlane(EpdBus& bus, uint8_t command, const uint8_t* data) {
+   if (!data) return;
++  const bool capture = freeink_panel_capture_enabled && freeink_panel_capture_plane && freeink_panel_capture_enabled();
+   resetRamCounter(bus);
+   bus.cmd(command);
+   const bool rotate180 = BoardConfig::ACTIVE.orientation.mirrorX && BoardConfig::ACTIVE.orientation.mirrorY;
+   if (!rotate180) {
+     bus.data(data, static_cast<uint16_t>(BUFFER_SIZE));
++    if (capture) freeink_panel_capture_plane(command, _renderGeneration, WIDTH, HEIGHT, 0, data, BUFFER_SIZE);
+     return;
+   }
+ 
+-  // A 180-degree 1-bpp raster rotation is a byte-order reversal plus a bit
+-  // reversal inside every byte. Stream it in bounded chunks so no second
+-  // framebuffer is required and keep CS asserted for the whole RAM write.
++  // Keep CS asserted for the whole rotated RAM write.
+   bus.beginTxn();
+   for (uint32_t sent = 0; sent < BUFFER_SIZE; sent += ROTATE_CHUNK_BYTES) {
+     const uint16_t count =
+         static_cast<uint16_t>((BUFFER_SIZE - sent) < ROTATE_CHUNK_BYTES ? (BUFFER_SIZE - sent) : ROTATE_CHUNK_BYTES);
+     for (uint16_t i = 0; i < count; ++i) ROTATE_CHUNK[i] = REVERSE_BITS_LUT[data[BUFFER_SIZE - 1 - sent - i]];
+     bus.rawWriteBytes(ROTATE_CHUNK, count);
++    if (capture) freeink_panel_capture_plane(command, _renderGeneration, WIDTH, HEIGHT, sent, ROTATE_CHUNK, count);
+   }
+   bus.endTxn();
+ }
+ 
+ void Ssd1683Driver::activate(EpdBus& bus, uint8_t control) {
++  const bool capture =
++      freeink_panel_capture_enabled && freeink_panel_capture_activation && freeink_panel_capture_enabled();
+   bus.cmd(0x22);
+   bus.data(control);
+   bus.cmd(0x20);
++  const uint32_t started = capture ? millis() : 0;
+   bus.waitRefreshComplete("SSD1683 refresh");
++  if (capture) freeink_panel_capture_activation(control, _renderGeneration, millis() - started);
+ }
+ 
+ void Ssd1683Driver::activateOtp(EpdBus& bus) {
