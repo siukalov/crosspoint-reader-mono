@@ -83,13 +83,6 @@ inline TouchPageTurn detectTouchPageTurn(GfxRenderer& renderer, const MappedInpu
   int x = 0;
   int y = 0;
 
-  // Instant turn at the press EDGE: with long-press behavior OFF there is no
-  // hold semantic to wait out, so a contact beginning inside a page zone acts
-  // immediately instead of at release — the finger's ~100 ms dwell comes off
-  // the page-turn latency. The excluded bands keep every release-classified
-  // edge gesture intact: top 14% (menu swipe), bottom 14% (home swipe), and
-  // the left quarter (back swipe) for the previous zone. The release tap of a
-  // fired contact is suppressed so it cannot act twice.
   if (SETTINGS.longPressButtonBehavior == SETTINGS.OFF && input.wasScreenTouchContact(x, y)) {
     const int width = renderer.getScreenWidth();
     const int height = renderer.getScreenHeight();
@@ -130,7 +123,6 @@ inline TouchPageTurn detectTouchPageTurn(GfxRenderer& renderer, const MappedInpu
   return result;
 }
 
-// Reader menu opens on a downward swipe from the top edge (replaces the old center tap-and-hold).
 inline bool isTouchMenuGesture(const MappedInputManager& input) {
   return SETTINGS.touchReaderControls && input.hasTouch() && input.wasMenuGesture();
 }
@@ -145,9 +137,6 @@ inline bool useBalancedReaderRefresh() {
 
 inline HalDisplay::RefreshMode refreshModeForCycle(int pagesUntilFullRefresh) {
 #if FREEINK_DEVICE_PAPERMONO
-  // Paper Mono's FULL mode is the explicit black/white endpoint sweep. Keep
-  // the user-selected cadence meaningful instead of substituting a HALF
-  // differential update which cannot fully discharge accumulated ghosting.
   return (pagesUntilFullRefresh <= 1) ? HalDisplay::FULL_REFRESH : HalDisplay::FAST_REFRESH;
 #else
   return (pagesUntilFullRefresh <= 1) ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
@@ -162,11 +151,6 @@ inline void advanceRefreshCycle(int& pagesUntilFullRefresh) {
   }
 }
 
-// One helper, blocking or deferred: the async form starts the refresh and
-// returns so the caller can overlap CPU work with the panel's refresh time.
-// Async callers must not touch the framebuffer until
-// renderer.waitRefreshComplete() and must rebuild the differential baseline
-// before the next page turn (the tiled grayscale cleanup does).
 inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh, bool async = false) {
   const auto mode = refreshModeForCycle(pagesUntilFullRefresh);
   if (async) {
@@ -174,60 +158,58 @@ inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntil
   } else {
     renderer.displayBuffer(mode);
   }
-  // Only a frame that reached the panel spends the ghost-cleanup countdown.
-  // Panels that paint synchronously always report committed, so this is a
-  // no-op for them. Paper Mono legitimately discards a superseded target, and
-  // letting that consume the countdown skips a deghost the user never gets.
+
   if (renderer.displayCommitted()) advanceRefreshCycle(pagesUntilFullRefresh);
 }
 
-// Grayscale anti-aliasing pass. Renders content twice (LSB + MSB) to build
-// the grayscale buffer. Only the content callback is re-rendered — status bars
-// and other overlays should be drawn before calling this.
-// Kept as a template to avoid std::function overhead; instantiated once per reader type.
 template <typename RenderFn>
-void renderAntiAliased(GfxRenderer& renderer, int& pagesUntilFullRefresh, RenderFn&& renderFn) {
-  // A queued page turn should not spend CPU building gray planes or start any
-  // panel waveform.
-  if (renderer.displayWorkAborted()) return;
-  if (!renderer.storeBwBuffer()) {
-    LOG_ERR("READER", "Failed to store BW buffer for anti-aliasing");
-    displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
-    return;
+bool renderAntiAliased(GfxRenderer& renderer, int& pagesUntilFullRefresh, int x, int y, int width, int height,
+                       RenderFn&& renderFn) {
+  if (renderer.displayWorkAborted() || !renderer.liveFrameValid()) return false;
+  {
+    GfxRenderer::ScopedTarget base(renderer, GfxRenderer::FrameOwner::ReaderBase);
+    renderer.displayGrayscaleBase(refreshModeForCycle(pagesUntilFullRefresh));
+  }
+  {
+    GfxRenderer::ScopedTarget scratch(renderer, GfxRenderer::FrameOwner::ReaderScratch);
+    if (!scratch.active() || !renderer.storeReaderBwScratch()) {
+      LOG_ERR("READER", "Failed to store BW buffer for anti-aliasing");
+      return false;
+    }
+    if (renderer.uiGrayEnabled() && !renderer.beginReaderImport(x, y, width, height)) {
+      renderer.restoreReaderBwScratch();
+      return false;
+    }
+
+    renderer.clearScreen(0x00);
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+    renderFn();
+    if (renderer.displayWorkAborted()) {
+      renderer.restoreReaderBwScratch();
+      return false;
+    }
+    renderer.copyGrayscaleLsbBuffers();
+
+    renderer.clearScreen(0x00);
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+    renderFn();
+    if (renderer.displayWorkAborted()) {
+      renderer.restoreReaderBwScratch();
+      return false;
+    }
+    renderer.copyGrayscaleMsbBuffers();
+
+    if (!renderer.restoreReaderBwScratch() || renderer.displayWorkAborted()) return false;
+    if (renderer.uiGrayEnabled() && !renderer.finishReaderImport()) return false;
   }
 
-  // Paper Mono retains this B/W target in host RAM until the two gray selector
-  // planes are ready, so the user sees one direct 3-gray page transition. Other
-  // drivers keep their normal base-then-overlay implementation.
-  renderer.displayGrayscaleBase(refreshModeForCycle(pagesUntilFullRefresh));
-
-  renderer.clearScreen(0x00);
-  renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
-  renderFn();
-  if (renderer.displayWorkAborted()) {
-    renderer.setRenderMode(GfxRenderer::BW);
-    renderer.restoreBwBuffer();
-    return;
-  }
-  renderer.copyGrayscaleLsbBuffers();
-
-  renderer.clearScreen(0x00);
-  renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
-  renderFn();
-  if (renderer.displayWorkAborted()) {
-    renderer.setRenderMode(GfxRenderer::BW);
-    renderer.restoreBwBuffer();
-    return;
-  }
-  renderer.copyGrayscaleMsbBuffers();
-
-  renderer.displayGrayBuffer();
-  // Charge the countdown against the activation that just ran, not against the
-  // base call above: on Paper Mono that one only stages the target in host RAM.
-  if (renderer.displayCommitted()) advanceRefreshCycle(pagesUntilFullRefresh);
+  GfxRenderer::ScopedTarget base(renderer, GfxRenderer::FrameOwner::ReaderBase);
   renderer.setRenderMode(GfxRenderer::BW);
-
-  renderer.restoreBwBuffer();
+  renderer.displayGrayBuffer();
+  const bool committed = renderer.displayCommitted();
+  if (committed) advanceRefreshCycle(pagesUntilFullRefresh);
+  if (!renderer.displayWorkAborted()) renderer.cleanupGrayscaleWithFrameBuffer();
+  return committed;
 }
 
 struct BackNavCallback {
@@ -235,13 +217,6 @@ struct BackNavCallback {
   void (*fn)(void*);
 };
 
-// Returns true if the back button was consumed (caller should return).
-// Long press (>= GO_BACK_OR_HOME_MS):
-// - default: go to file browser
-// - with backShortToFileBrowser: go home
-// Short press (< GO_BACK_OR_HOME_MS):
-// - default: go home
-// - with backShortToFileBrowser: go to file browser.
 inline bool handleBackNavigation(const MappedInputManager& mappedInput, ActivityManager& activityManager,
                                  const char* filePath, BackNavCallback goHome) {
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= GO_BACK_OR_HOME_MS) {

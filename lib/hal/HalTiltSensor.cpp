@@ -104,8 +104,8 @@ bool HalTiltSensor::isRaisedPose() {
   forward /= got;
   roll /= got;
   normal /= got;
-  const bool raised = normal > 0.0f && forward >= RAISED_POSE_MIN_FORWARD_G &&
-                      forward <= RAISED_POSE_MAX_FORWARD_G && fabsf(roll) <= RAISED_POSE_MAX_ROLL_G;
+  const bool raised = normal > 0.0f && forward >= RAISED_POSE_MIN_FORWARD_G && forward <= RAISED_POSE_MAX_FORWARD_G &&
+                      fabsf(roll) <= RAISED_POSE_MAX_ROLL_G;
   LOG_INF("GYR", "Raise pose: fwd=%.2fg roll=%.2fg normal=%.2fg -> %s", forward, roll, normal,
           raised ? "raised" : "not raised");
   return raised;

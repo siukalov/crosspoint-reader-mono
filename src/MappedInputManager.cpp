@@ -9,9 +9,6 @@
 #include "components/UITheme.h"
 
 bool MappedInputManager::isNavDirectionSwapped() const {
-  // Key the swap on the orientation the screen is *actually* rendered at, not the persisted reader
-  // setting. The reader (and its modal menus) render rotated, so navigation/labels flip there; the
-  // home and settings UI render in portrait, so they never flip even when a rotated reader is configured.
   const auto orientation = renderer.getOrientation();
   return SETTINGS.frontButtonFollowOrientation &&
          (orientation == GfxRenderer::PortraitInverted || orientation == GfxRenderer::LandscapeCounterClockwise);
@@ -22,28 +19,20 @@ bool MappedInputManager::mapButton(const Button button, bool (HalGPIO::*fn)(uint
 
   switch (button) {
     case Button::Back:
-      // Logical Back maps to user-configured front button.
       return (gpio.*fn)(SETTINGS.frontButtonBack);
     case Button::Confirm:
-      // Logical Confirm maps to user-configured front button.
       return (gpio.*fn)(SETTINGS.frontButtonConfirm);
     case Button::Left:
-      // Logical Left maps to user-configured front button.
       return (gpio.*fn)(SETTINGS.frontButtonLeft);
     case Button::Right:
-      // Logical Right maps to user-configured front button.
       return (gpio.*fn)(SETTINGS.frontButtonRight);
     case Button::Up:
-      // Side buttons remain fixed for Up/Down.
       return (gpio.*fn)(HalGPIO::BTN_UP);
     case Button::Down:
-      // Side buttons remain fixed for Up/Down.
       return (gpio.*fn)(HalGPIO::BTN_DOWN);
     case Button::Power:
-      // Power button bypasses remapping.
       return (gpio.*fn)(HalGPIO::BTN_POWER);
     case Button::PageBack:
-      // Reader page navigation uses side buttons and can be swapped via settings.
       switch (sideLayout) {
         case CrossPointSettings::PREV_NEXT:
           return (gpio.*fn)(HalGPIO::BTN_UP);
@@ -54,7 +43,6 @@ bool MappedInputManager::mapButton(const Button button, bool (HalGPIO::*fn)(uint
           return false;
       }
     case Button::PageForward:
-      // Reader page navigation uses side buttons and can be swapped via settings.
       switch (sideLayout) {
         case CrossPointSettings::PREV_NEXT:
           return (gpio.*fn)(HalGPIO::BTN_DOWN);
@@ -65,12 +53,9 @@ bool MappedInputManager::mapButton(const Button button, bool (HalGPIO::*fn)(uint
           return false;
       }
     case Button::NavNext:
-      // Logical "next item" navigation: side Down + front Right, with the control axis flipped in
-      // INVERTED / LANDSCAPE_CCW (frontButtonFollowOrientation) so it matches the rotated hint labels.
       return isNavDirectionSwapped() ? (mapButton(Button::Up, fn) || mapButton(Button::Left, fn))
                                      : (mapButton(Button::Down, fn) || mapButton(Button::Right, fn));
     case Button::NavPrevious:
-      // Logical "previous item" navigation: side Up + front Left, axis-flipped in the same orientations.
       return isNavDirectionSwapped() ? (mapButton(Button::Down, fn) || mapButton(Button::Right, fn))
                                      : (mapButton(Button::Up, fn) || mapButton(Button::Left, fn));
   }
@@ -98,7 +83,6 @@ bool MappedInputManager::wasScreenTapped(int& x, int& y) const {
   if (debugTapPending) {
     x = debugTapX;
     y = debugTapY;
-    debugTapPending = false;
     touchHeldOverrideValid = true;
     touchHeldOverrideMs = 40;
     touchHeldOverrideAt = millis();
@@ -108,8 +92,6 @@ bool MappedInputManager::wasScreenTapped(int& x, int& y) const {
   float ny = 0.0f;
   if (!gpio.wasTouchTap(nx, ny)) return false;
   if (suppressNextTouchTap) {
-    // The reader already turned the page at this contact's press edge;
-    // swallow its release so the same touch doesn't act twice.
     suppressNextTouchTap = false;
     return false;
   }
@@ -119,10 +101,6 @@ bool MappedInputManager::wasScreenTapped(int& x, int& y) const {
 }
 
 bool MappedInputManager::wasScreenTouchContact(int& x, int& y) const {
-  // A suppressed contact that ended as a drag (release without a tap) must
-  // disarm here, or the stale flag would swallow the next unrelated tap. A
-  // suppressed contact ending as a TAP stays armed: wasScreenTapped() above
-  // swallows it on this same frame and clears the flag itself.
   if (suppressNextTouchTap && gpio.wasTouchReleased()) {
     float tnx = 0.0f;
     float tny = 0.0f;
@@ -131,7 +109,7 @@ bool MappedInputManager::wasScreenTouchContact(int& x, int& y) const {
   float nx = 0.0f;
   float ny = 0.0f;
   if (!gpio.wasTouchDown(nx, ny)) return false;
-  suppressNextTouchTap = false;  // new contact, new decision
+  suppressNextTouchTap = false;
   renderer.tapToLogical(nx, ny, x, y);
   return true;
 }
@@ -153,7 +131,6 @@ bool MappedInputManager::wasScreenTouchDown(int& x, int& y) const {
 }
 
 bool MappedInputManager::isScreenTouchHeld(int& x, int& y) const {
-  // Live contact position while the finger is down (no tap-slop gate) — drag tracking.
   float nx = 0.0f;
   float ny = 0.0f;
   if (!gpio.isTouchHeldAt(nx, ny)) return false;
@@ -268,9 +245,6 @@ MappedInputManager::SwipeDir MappedInputManager::wasSwipe() const {
 }
 
 bool MappedInputManager::wasBackGesture() const {
-  // Back = left-to-right swipe starting near the left edge. Edge-anchored so that
-  // mid-screen horizontal swipes stay available to activities that consume
-  // SwipeDir::Left/Right (e.g. percent selection, image viewer).
   int sx = 0;
   int sy = 0;
   int ex = 0;
@@ -283,7 +257,6 @@ bool MappedInputManager::wasBackGesture() const {
 }
 
 bool MappedInputManager::wasMenuGesture() const {
-  // Downward swipe starting at the top edge (mirror of the bottom-edge home gesture).
   int sx = 0;
   int sy = 0;
   int ex = 0;
@@ -338,14 +311,11 @@ unsigned long MappedInputManager::getHeldTime() const {
 
 MappedInputManager::Labels MappedInputManager::mapLabels(const char* back, const char* confirm, const char* previous,
                                                          const char* next) const {
-  // Swap previous/next labels to match the page turn direction swap in INVERTED and LANDSCAPE_CCW.
   const bool swapLabels = isNavDirectionSwapped();
   const char* leftLabel = swapLabels ? next : previous;
   const char* rightLabel = swapLabels ? previous : next;
 
-  // Build the label order based on the configured hardware mapping.
   auto labelForHardware = [&](uint8_t hw) -> const char* {
-    // Compare against configured logical roles and return the matching label.
     if (hw == SETTINGS.frontButtonBack) {
       return back;
     }
@@ -366,8 +336,6 @@ MappedInputManager::Labels MappedInputManager::mapLabels(const char* back, const
 }
 
 int MappedInputManager::getPressedFrontButton() const {
-  // Scan the raw front buttons in hardware order.
-  // This bypasses remapping so the remap activity can capture physical presses.
   if (gpio.wasPressed(HalGPIO::BTN_BACK)) {
     return HalGPIO::BTN_BACK;
   }

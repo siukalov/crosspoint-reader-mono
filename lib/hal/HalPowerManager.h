@@ -17,10 +17,10 @@ class HalPowerManager {
   int normalFreq = 0;  // MHz
   bool isLowPower = false;
 
-  mutable int _batteryCachedPercent = 0;          // Last read battery percentage (0-100)
-  mutable bool _batteryCachedPercentValid = false; // False until the first successful read, so the
-                                                   // notch hysteresis doesn't anchor itself to the 0 seed
-  mutable uint16_t _batteryCachedMillivolts = 0;  // Last read cell voltage; 0 = never read
+  mutable int _batteryCachedPercent = 0;            // Last read battery percentage (0-100)
+  mutable bool _batteryCachedPercentValid = false;  // False until the first successful read, so the
+                                                    // notch hysteresis doesn't anchor itself to the 0 seed
+  mutable uint16_t _batteryCachedMillivolts = 0;    // Last read cell voltage; 0 = never read
   mutable bool _batteryCachedCharging = false;
   mutable bool _batteryCachedChargingKnown = false;
   mutable unsigned long _batteryLastPollMs = 0;  // Timestamp of last battery read in milliseconds

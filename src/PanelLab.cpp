@@ -368,7 +368,8 @@ bool g_lutDump = false;
 void dumpLut(const Lut& lut, uint16_t frames, uint32_t frameUs, uint32_t busyUs) {
   if (!g_lutDump) return;
   static const char* const kVs[4] = {"--", "+15", "-15", " +5"};
-  Serial.println("  LUT  grp | e1  A   B   C   D | e2                | e3                | TPA TPB TPC TPD  RP | frames");
+  Serial.println(
+      "  LUT  grp | e1  A   B   C   D | e2                | e3                | TPA TPB TPC TPD  RP | frames");
   uint32_t total = 0;
   for (uint8_t g = 0; g < 10; ++g) {
     const uint8_t* tp = &lut.b[50 + g * 5];
@@ -384,8 +385,7 @@ void dumpLut(const Lut& lut, uint16_t frames, uint32_t frameUs, uint32_t busyUs)
       for (uint8_t p = 0; p < 4; ++p) Serial.printf(" %s", kVs[(row >> ((3 - p) * 2)) & 0x03]);
       Serial.print(" |");
     }
-    Serial.printf(" %3u %3u %3u %3u %3u | %lu\n", tp[0], tp[1], tp[2], tp[3], tp[4],
-                  static_cast<unsigned long>(cost));
+    Serial.printf(" %3u %3u %3u %3u %3u | %lu\n", tp[0], tp[1], tp[2], tp[3], tp[4], static_cast<unsigned long>(cost));
     total += cost;
   }
   const uint32_t predicted = total * frameUs;
@@ -396,8 +396,7 @@ void dumpLut(const Lut& lut, uint16_t frames, uint32_t frameUs, uint32_t busyUs)
   const long slop = static_cast<long>(frameUs) + static_cast<long>(predicted / 100u);
   Serial.printf("  LUT  %lu frames (accounted %u) -> predicted %lu us, measured %lu us, delta %+ld us%s\n",
                 static_cast<unsigned long>(total), frames, static_cast<unsigned long>(predicted),
-                static_cast<unsigned long>(busyUs), err,
-                err < -slop ? "   << WAVEFORM SHORTER THAN LUT" : "");
+                static_cast<unsigned long>(busyUs), err, err < -slop ? "   << WAVEFORM SHORTER THAN LUT" : "");
 }
 
 void loadLut(const Lut& lut) {
@@ -504,15 +503,14 @@ void reportPlanes(uint32_t us24, uint32_t us26) {
   const uint32_t total = us24 + us26;
   const uint32_t kbps = total ? static_cast<uint32_t>((2ULL * PLANE_BYTES * 1000ULL) / total) : 0;
   Serial.printf("  planes: 0x24=%lu us  0x26=%lu us  total=%lu us  (%lu KB/s @ %lu MHz)\n",
-                static_cast<unsigned long>(us24), static_cast<unsigned long>(us26),
-                static_cast<unsigned long>(total), static_cast<unsigned long>(kbps),
-                static_cast<unsigned long>(g_spiHz / 1000000));
+                static_cast<unsigned long>(us24), static_cast<unsigned long>(us26), static_cast<unsigned long>(total),
+                static_cast<unsigned long>(kbps), static_cast<unsigned long>(g_spiHz / 1000000));
 }
 
 void reportTiming(const char* label, const Timing& t) {
-  Serial.printf("  %s: assert=%lu us  waveform=%lu us (%lu ms)%s\n", label,
-                static_cast<unsigned long>(t.assertUs), static_cast<unsigned long>(t.busyUs),
-                static_cast<unsigned long>(t.busyUs / 1000), t.timedOut ? "  TIMEOUT" : "");
+  Serial.printf("  %s: assert=%lu us  waveform=%lu us (%lu ms)%s\n", label, static_cast<unsigned long>(t.assertUs),
+                static_cast<unsigned long>(t.busyUs), static_cast<unsigned long>(t.busyUs / 1000),
+                t.timedOut ? "  TIMEOUT" : "");
 }
 
 // OTP bank refresh: pick a waveform bank with the fake-temperature register and
@@ -561,8 +559,8 @@ void customRefresh(const Lut& lut, uint8_t control, bool reinit, const char* lab
 // frames so the fixed activation overhead cancels). The series is exact:
 // code 1..8 = 25..200 Hz in 25 Hz steps, code 9..15 = the 12.5 Hz half-steps,
 // code 0 = 15 Hz.
-constexpr uint32_t FRAME_US[16] = {66400, 39800, 19900, 13300, 9950, 7975,  6650,  5700,
-                                   5000,  26575, 15925, 11400, 8850, 7250,  6150,  5300};
+constexpr uint32_t FRAME_US[16] = {66400, 39800, 19900, 13300, 9950, 7975, 6650, 5700,
+                                   5000,  26575, 15925, 11400, 8850, 7250, 6150, 5300};
 
 // Source voltages, from cmd 0x04: VSH1 = +15 V, VSH2 = +5 V, VSL = -15 V.
 // VSH2 being a third of VSH1 is what makes fine gray modulation practical —
@@ -574,17 +572,17 @@ constexpr uint8_t VS_WHITE = 0x02;  // VSL  -15 V
 constexpr uint8_t VS_WEAK = 0x03;   // VSH2 +5 V
 
 struct GrayParams {
-  uint8_t fr = 0x04;       // frame-rate code (0x04 = 100 Hz, 9.95 ms/frame)
-  uint8_t shake = 0;       // frames per half-cycle of the pre-shake
-  uint8_t shakeRep = 0;    // extra repeats of the shake pair
-  uint8_t toBlack = 20;    // frames driving every pixel to the black rail
-  uint8_t toWhite = 20;    // frames driving every pixel to the white rail
-  uint8_t a = 7;           // modulation sub-phase A (light gray and darker)
-  uint8_t b = 5;           // sub-phase B (dark gray and darker)
-  uint8_t c = 8;           // sub-phase C (black only)
+  uint8_t fr = 0x04;     // frame-rate code (0x04 = 100 Hz, 9.95 ms/frame)
+  uint8_t shake = 0;     // frames per half-cycle of the pre-shake
+  uint8_t shakeRep = 0;  // extra repeats of the shake pair
+  uint8_t toBlack = 20;  // frames driving every pixel to the black rail
+  uint8_t toWhite = 20;  // frames driving every pixel to the white rail
+  uint8_t a = 7;         // modulation sub-phase A (light gray and darker)
+  uint8_t b = 5;         // sub-phase B (dark gray and darker)
+  uint8_t c = 8;         // sub-phase C (black only)
   uint8_t modCode = VS_BLACK;
-  uint8_t scheme = 1;  // 0 = reset-to-white then drive black; 1 = merged (see below)
-  uint8_t border = 0x80;  // SSD1677 VCOM border (HiZ would be 0xC0)
+  uint8_t scheme = 1;       // 0 = reset-to-white then drive black; 1 = merged (see below)
+  uint8_t border = 0x80;    // SSD1677 VCOM border (HiZ would be 0xC0)
   uint8_t ctrlCold = 0xCC;  // power up + display, hold power
   uint8_t ctrlWarm = 0x0C;  // display only, already powered
   uint8_t vgh = 0x17, vsh1 = 0x41, vsh2 = 0xA8, vsl = 0x32, vcom = 0x30;
@@ -607,7 +605,7 @@ struct GrayParams {
   uint8_t pulseOn = 1;          // driven frames per pulse
   uint8_t pulseOff = 1;         // opposing frames per pulse (0 = continuous drive)
   uint8_t pulseCode = VS_WEAK;  // opposing drive (VSH2 +5 V by default)
-  uint8_t rampCode = VS_WEAK;  // drive used by 'ramp 1' (white -> black direction)
+  uint8_t rampCode = VS_WEAK;   // drive used by 'ramp 1' (white -> black direction)
   // Single-activation 3-gray ('tri'). All times in frames at frRet.
   //
   // DC balance is NOT deferred here: each of the three driven classes is net
@@ -932,9 +930,8 @@ void deepClear(uint8_t cycles) {
   // Equal black and white frames per cycle, so this is the corrective refresh:
   // it is net-zero by construction and resets the accumulated envelope.
   dcReset();
-  Serial.printf("deep clear: %u cycles, %lu frames, %lu us (%lu ms)\n", cycles,
-                static_cast<unsigned long>(frames), static_cast<unsigned long>(t.busyUs),
-                static_cast<unsigned long>(t.busyUs / 1000));
+  Serial.printf("deep clear: %u cycles, %lu frames, %lu us (%lu ms)\n", cycles, static_cast<unsigned long>(frames),
+                static_cast<unsigned long>(t.busyUs), static_cast<unsigned long>(t.busyUs / 1000));
 }
 
 // Drive every pixel hard to whatever is staged in g_p24/g_p26, quantised to
@@ -1306,9 +1303,12 @@ void reportBalance(const Lut& lut, const GrayParams& p) {
       for (uint8_t phase = 0; phase < 4; ++phase) {
         const uint8_t code = (vs >> ((3 - phase) * 2)) & 0x03;
         const long frames = lut.b[50 + group * 5 + phase] * (rp + 1L);
-        if (code == VS_BLACK) net += 15 * frames;
-        else if (code == VS_WHITE) net -= 15 * frames;
-        else if (code == VS_WEAK) net += 5 * frames;
+        if (code == VS_BLACK)
+          net += 15 * frames;
+        else if (code == VS_WHITE)
+          net -= 15 * frames;
+        else if (code == VS_WEAK)
+          net += 5 * frames;
       }
     }
     static constexpr const char* kNames[4] = {"white", "light", "dark", "black"};
@@ -1458,9 +1458,9 @@ void saturateReturn() {
   for (uint32_t i = 0; i < PLANE_BYTES; ++i) {
     const uint8_t chg = static_cast<uint8_t>((g_prev24[i] ^ g_p24[i]) | (g_prev26[i] ^ g_p26[i]));
     const uint8_t nonWhite = static_cast<uint8_t>(g_p24[i] | g_p26[i]);
-    g_inv24[i] = chg;                                          // keep the mask for pass 2
-    g_d24[i] = static_cast<uint8_t>(chg & nonWhite);           // -> black rail
-    g_d26[i] = static_cast<uint8_t>(chg & ~nonWhite);          // -> white rail
+    g_inv24[i] = chg;                                  // keep the mask for pass 2
+    g_d24[i] = static_cast<uint8_t>(chg & nonWhite);   // -> black rail
+    g_d26[i] = static_cast<uint8_t>(chg & ~nonWhite);  // -> white rail
     if (chg) any = true;
   }
   const uint32_t buildUs = micros() - buildStart;
@@ -1596,8 +1596,7 @@ void triLevel(bool corrective) {
     const uint8_t q26 = static_cast<uint8_t>(lo & hi);  // black
     // A corrective pass drives everything: the accumulated bias sits on every
     // pixel, not only the ones this page turn happens to change.
-    const uint8_t chg =
-        corrective ? 0xFFu : static_cast<uint8_t>((g_prev24[i] ^ q24) | (g_prev26[i] ^ q26));
+    const uint8_t chg = corrective ? 0xFFu : static_cast<uint8_t>((g_prev24[i] ^ q24) | (g_prev26[i] ^ q26));
     g_d24[i] = static_cast<uint8_t>(chg & ~(q24 ^ q26));
     g_d26[i] = static_cast<uint8_t>(chg & q24);
     g_inv24[i] = q24;  // stash the quantised image; it becomes prev on commit
@@ -1677,7 +1676,7 @@ void triLevel(bool corrective) {
   // G0 contributes +2h to white, 0 to gray (out and back), -2h to black.
   const int32_t h = upHalf;
   const int32_t net[3] = {
-      15 * (2 * h - satF),                       // white
+      15 * (2 * h - satF),                                // white
       15 * (fast - satF) + 5 * static_cast<int32_t>(tg),  // gray
       15 * (static_cast<int32_t>(tb) - satF - 2 * h),     // black
   };
@@ -1765,10 +1764,9 @@ void directThreeLevel() {
     g_inv24[i] = q24;
     g_inv26[i] = q26;
     changed += static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned>(lighten | darken)));
-    distanceTwo += static_cast<uint32_t>(
-        __builtin_popcount(static_cast<unsigned>((oldWhite & q26) | (old26 & targetWhite))));
-    cleanPixels +=
-        static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned>(old24 & targetWhite)));
+    distanceTwo +=
+        static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned>((oldWhite & q26) | (old26 & targetWhite))));
+    cleanPixels += static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned>(old24 & targetWhite)));
   }
   const uint32_t build1Us = micros() - build1Started;
   if (changed == 0) {
@@ -1804,9 +1802,7 @@ void directThreeLevel() {
       const uint8_t targetWhite = static_cast<uint8_t>(~q24);
       const uint8_t whiteToBlack = static_cast<uint8_t>(~old24 & q26);
       const uint8_t blackToWhite = static_cast<uint8_t>(old26 & targetWhite);
-      const uint8_t grayToWhite = includeWhiteClean
-                                      ? static_cast<uint8_t>(old24 & ~old26 & targetWhite)
-                                      : 0u;
+      const uint8_t grayToWhite = includeWhiteClean ? static_cast<uint8_t>(old24 & ~old26 & targetWhite) : 0u;
       g_d24[i] = static_cast<uint8_t>(blackToWhite | grayToWhite);
       g_d26[i] = static_cast<uint8_t>(whiteToBlack | grayToWhite);
     }
@@ -1827,17 +1823,16 @@ void directThreeLevel() {
 
   memcpy(g_prev24, g_inv24, PLANE_BYTES);
   memcpy(g_prev26, g_inv26, PLANE_BYTES);
-  const long q = 15L * (static_cast<long>(g_gray.stepToward) - g_gray.stepAway) *
-                 (g_gray.stepCycles == 0 ? 1 : g_gray.stepCycles);
+  const long q =
+      15L * (static_cast<long>(g_gray.stepToward) - g_gray.stepAway) * (g_gray.stepCycles == 0 ? 1 : g_gray.stepCycles);
   Serial.printf("gtg3: changed=%lu long=%lu white-clean=%lu Q=%+ld V*frames/level; frames=%u+%u\n",
                 static_cast<unsigned long>(changed), static_cast<unsigned long>(distanceTwo),
                 static_cast<unsigned long>(cleanPixels), q, firstFrames, secondFrames);
-  Serial.printf("  build=%lu+%lu us planes=%lu us waves=%lu+%lu us total=%lu ms\n",
-                static_cast<unsigned long>(build1Us), static_cast<unsigned long>(build2Us),
-                static_cast<unsigned long>(planesUs), static_cast<unsigned long>(firstTiming.busyUs),
-                static_cast<unsigned long>(secondBusyUs),
-                static_cast<unsigned long>((build1Us + build2Us + planesUs + firstTiming.busyUs + secondBusyUs) /
-                                           1000));
+  Serial.printf(
+      "  build=%lu+%lu us planes=%lu us waves=%lu+%lu us total=%lu ms\n", static_cast<unsigned long>(build1Us),
+      static_cast<unsigned long>(build2Us), static_cast<unsigned long>(planesUs),
+      static_cast<unsigned long>(firstTiming.busyUs), static_cast<unsigned long>(secondBusyUs),
+      static_cast<unsigned long>((build1Us + build2Us + planesUs + firstTiming.busyUs + secondBusyUs) / 1000));
 }
 
 // Same source history and completed W/G/B->white transition everywhere, then a
@@ -1883,10 +1878,9 @@ void cleanupAbCompare(uint8_t loops) {
   loadLut(clean);
   const Timing timing = activateTimed(g_controllerPowered ? g_gray.ctrlWarm : g_gray.ctrlCold);
   dumpLut(clean, frames, FRAME_US[g_gray.frRet & 0x0F], timing.busyUs);
-  Serial.printf("abclean: %u identical loops; A=side thirds/no clean, B=center third/%u cycles\n", loops,
-                savedClean);
-  Serial.printf("  cleanup=%u frames planes=%lu us wave=%lu us%s\n", frames,
-                static_cast<unsigned long>(planesUs), static_cast<unsigned long>(timing.busyUs),
+  Serial.printf("abclean: %u identical loops; A=side thirds/no clean, B=center third/%u cycles\n", loops, savedClean);
+  Serial.printf("  cleanup=%u frames planes=%lu us wave=%lu us%s\n", frames, static_cast<unsigned long>(planesUs),
+                static_cast<unsigned long>(timing.busyUs),
                 (timing.assertUs == 0 || timing.busyUs == 0 || timing.timedOut) ? "  ERROR" : "");
   Serial.println("  Please judge the physical screen: center(B) vs both sides(A).");
 }
@@ -2065,19 +2059,19 @@ void rampTest(uint8_t stepFrames, uint8_t bands, uint8_t dir) {
 
   const uint32_t frameUs = FRAME_US[g_gray.frRet & 0x0F];
   const uint8_t perPulse = static_cast<uint8_t>(g_gray.pulseOn + g_gray.pulseOff);
-  Serial.printf("ramp dir=%u (%s): %u bands x %u rows, %u pulse(s)/step, pulse=%u(code %u)+%u(code %u) @ fr 0x%X "
-                "(%lu us/frame)\n",
-                dir, dir ? "white->black" : "black->white", bands, rowsPerBand, stepFrames, g_gray.pulseOn, driveCode,
-                g_gray.pulseOff, g_gray.pulseCode, g_gray.frRet, static_cast<unsigned long>(frameUs));
+  Serial.printf(
+      "ramp dir=%u (%s): %u bands x %u rows, %u pulse(s)/step, pulse=%u(code %u)+%u(code %u) @ fr 0x%X "
+      "(%lu us/frame)\n",
+      dir, dir ? "white->black" : "black->white", bands, rowsPerBand, stepFrames, g_gray.pulseOn, driveCode,
+      g_gray.pulseOff, g_gray.pulseCode, g_gray.frRet, static_cast<unsigned long>(frameUs));
   Serial.println("band(top=0)  pulses  drive_frames  elapsed_us");
   for (uint8_t i = 0; i < bands; ++i) {
     const uint32_t p = static_cast<uint32_t>(i) * stepFrames;
     Serial.printf("  %2u         %4lu     %4lu          %6lu\n", i, static_cast<unsigned long>(p),
                   static_cast<unsigned long>(p * g_gray.pulseOn), static_cast<unsigned long>(p * perPulse * frameUs));
   }
-  Serial.printf("saturate=%lu us  pulses=%lu us  planes=%lu us  TOTAL=%lu ms\n",
-                static_cast<unsigned long>(t0.busyUs), static_cast<unsigned long>(pulseUs),
-                static_cast<unsigned long>(planeUs),
+  Serial.printf("saturate=%lu us  pulses=%lu us  planes=%lu us  TOTAL=%lu ms\n", static_cast<unsigned long>(t0.busyUs),
+                static_cast<unsigned long>(pulseUs), static_cast<unsigned long>(planeUs),
                 static_cast<unsigned long>((t0.busyUs + pulseUs + planeUs) / 1000));
   Serial.println("(screen is a calibration ramp, not a valid image -- run 'clear' before 'sat')");
 }
@@ -2098,7 +2092,7 @@ void bwTransition() {
 
   cmd(CMD_BORDER);
   data(g_gray.border);
-  const uint32_t us24 = writePlane(CMD_WRITE_NEW, g_p26);    // new
+  const uint32_t us24 = writePlane(CMD_WRITE_NEW, g_p26);     // new
   const uint32_t us26 = writePlane(CMD_WRITE_OLD, g_prev26);  // old
   loadLut(lut);
   const Timing t = activateTimed(g_gray.ctrlWarm);
@@ -2132,9 +2126,8 @@ void runGray(bool warm) {
                 static_cast<unsigned long>(frames));
   reportBalance(lut, g_gray);
   reportPlanes(us24, us26);
-  Serial.printf("  predicted waveform=%lu us  measured=%lu us  delta=%ld us\n",
-                static_cast<unsigned long>(predictedUs), static_cast<unsigned long>(t.busyUs),
-                static_cast<long>(t.busyUs) - static_cast<long>(predictedUs));
+  Serial.printf("  predicted waveform=%lu us  measured=%lu us  delta=%ld us\n", static_cast<unsigned long>(predictedUs),
+                static_cast<unsigned long>(t.busyUs), static_cast<long>(t.busyUs) - static_cast<long>(predictedUs));
   Serial.printf("  TOTAL refresh = %lu us (%lu ms)\n", static_cast<unsigned long>(us24 + us26 + t.busyUs),
                 static_cast<unsigned long>((us24 + us26 + t.busyUs) / 1000));
   commitDisplayed();
@@ -2147,8 +2140,7 @@ void runGray(bool warm) {
 void burst(uint8_t count) {
   Lut lut;
   const uint32_t frames = buildGrayLut(lut, g_gray);
-  Serial.printf("=== burst x%u (waveform %lu frames) ===\n", count,
-                static_cast<unsigned long>(frames));
+  Serial.printf("=== burst x%u (waveform %lu frames) ===\n", count, static_cast<unsigned long>(frames));
   for (uint32_t i = 0; i < PLANE_BYTES; ++i) {
     g_inv24[i] = static_cast<uint8_t>(~g_p24[i]);
     g_inv26[i] = static_cast<uint8_t>(~g_p26[i]);
@@ -2169,9 +2161,8 @@ void burst(uint8_t count) {
     const uint32_t gap = (waveStart - cycleStart) + (cycle - (waveStart - cycleStart) - t.busyUs);
     sumCycle += cycle;
     sumGap += gap;
-    Serial.printf("  %u: cycle=%lu us  waveform=%lu us  overhead=%lu us\n", i,
-                  static_cast<unsigned long>(cycle), static_cast<unsigned long>(t.busyUs),
-                  static_cast<unsigned long>(gap));
+    Serial.printf("  %u: cycle=%lu us  waveform=%lu us  overhead=%lu us\n", i, static_cast<unsigned long>(cycle),
+                  static_cast<unsigned long>(t.busyUs), static_cast<unsigned long>(gap));
   }
   Serial.printf("  avg cycle=%lu us  avg overhead=%lu us  -> %lu refresh/s\n",
                 static_cast<unsigned long>(sumCycle / count), static_cast<unsigned long>(sumGap / count),
@@ -2183,58 +2174,96 @@ void printGrayParams() {
   Serial.printf("scheme=%u fr=0x%X shake=%u shakeRep=%u toBlack=%u toWhite=%u a=%u b=%u c=%u mod=%u\n", g_gray.scheme,
                 g_gray.fr, g_gray.shake, g_gray.shakeRep, g_gray.toBlack, g_gray.toWhite, g_gray.a, g_gray.b, g_gray.c,
                 g_gray.modCode);
-  Serial.printf("border=0x%02X ctrlCold=0x%02X ctrlWarm=0x%02X vgh=0x%02X vsh1=0x%02X vsh2=0x%02X vsl=0x%02X vcom=0x%02X\n",
-                g_gray.border, g_gray.ctrlCold, g_gray.ctrlWarm, g_gray.vgh, g_gray.vsh1, g_gray.vsh2, g_gray.vsl,
-                g_gray.vcom);
+  Serial.printf(
+      "border=0x%02X ctrlCold=0x%02X ctrlWarm=0x%02X vgh=0x%02X vsh1=0x%02X vsh2=0x%02X vsl=0x%02X vcom=0x%02X\n",
+      g_gray.border, g_gray.ctrlCold, g_gray.ctrlWarm, g_gray.vgh, g_gray.vsh1, g_gray.vsh2, g_gray.vsl, g_gray.vcom);
   Serial.printf("tri: preUp=%u satWhite=%u grayFast=%u tGray=%u tBlack=%u frRet=0x%X dcEvery=%u lutdump=%u\n",
                 g_gray.preUp, g_gray.satWhite, g_gray.grayFast, g_gray.tGray, g_gray.tBlack, g_gray.frRet,
                 g_gray.dcEvery, g_lutDump ? 1 : 0);
   Serial.printf("     balanced when preUp==satWhite, tBlack==2*satWhite, tGray==3*satWhite\n");
-  Serial.printf("gtg3: away=%u toward=%u cycles=%u postClean=%u (Q=%ld nominal V*frames per level)\n",
-                g_gray.stepAway, g_gray.stepToward, g_gray.stepCycles, g_gray.postClean,
+  Serial.printf("gtg3: away=%u toward=%u cycles=%u postClean=%u (Q=%ld nominal V*frames per level)\n", g_gray.stepAway,
+                g_gray.stepToward, g_gray.stepCycles, g_gray.postClean,
                 15L * (static_cast<long>(g_gray.stepToward) - g_gray.stepAway) * g_gray.stepCycles);
 }
 
 bool setGrayParam(const String& key, long value) {
   const uint8_t v = static_cast<uint8_t>(value);
-  if (key == "fr") g_gray.fr = static_cast<uint8_t>(value & 0x0F);
-  else if (key == "shake") g_gray.shake = v;
-  else if (key == "shakerep") g_gray.shakeRep = v;
-  else if (key == "toblack") g_gray.toBlack = v;
-  else if (key == "towhite") g_gray.toWhite = v;
-  else if (key == "a") g_gray.a = v;
-  else if (key == "b") g_gray.b = v;
-  else if (key == "c") g_gray.c = v;
-  else if (key == "mod") g_gray.modCode = static_cast<uint8_t>(value & 0x03);
-  else if (key == "scheme") g_gray.scheme = v;
-  else if (key == "border") g_gray.border = v;
-  else if (key == "ctrlcold") g_gray.ctrlCold = v;
-  else if (key == "ctrlwarm") g_gray.ctrlWarm = v;
-  else if (key == "vgh") g_gray.vgh = v;
-  else if (key == "vsh1") g_gray.vsh1 = v;
-  else if (key == "vsh2") g_gray.vsh2 = v;
-  else if (key == "vsl") g_gray.vsl = v;
-  else if (key == "vcom") g_gray.vcom = v;
-  else if (key == "dclimit") g_gray.dcLimit = v;
-  else if (key == "swing") g_gray.satSwing = v;
-  else if (key == "pulldark") g_gray.pullDark = v;
-  else if (key == "pulllight") g_gray.pullLight = v;
-  else if (key == "frret") g_gray.frRet = static_cast<uint8_t>(value & 0x0F);
-  else if (key == "pulseon") g_gray.pulseOn = v;
-  else if (key == "pulseoff") g_gray.pulseOff = v;
-  else if (key == "pulsecode") g_gray.pulseCode = static_cast<uint8_t>(value & 0x03);
-  else if (key == "rampcode") g_gray.rampCode = static_cast<uint8_t>(value & 0x03);
-  else if (key == "preup") g_gray.preUp = v;
-  else if (key == "satwhite") g_gray.satWhite = v;
-  else if (key == "grayfast") g_gray.grayFast = v;
-  else if (key == "tgray") g_gray.tGray = v;
-  else if (key == "tblack") g_gray.tBlack = v;
-  else if (key == "dcevery") g_gray.dcEvery = v;
-  else if (key == "stepaway") g_gray.stepAway = v;
-  else if (key == "steptoward") g_gray.stepToward = v;
-  else if (key == "stepcycles") g_gray.stepCycles = v;
-  else if (key == "postclean") g_gray.postClean = v;
-  else if (key == "lutdump") g_lutDump = v != 0;
+  if (key == "fr")
+    g_gray.fr = static_cast<uint8_t>(value & 0x0F);
+  else if (key == "shake")
+    g_gray.shake = v;
+  else if (key == "shakerep")
+    g_gray.shakeRep = v;
+  else if (key == "toblack")
+    g_gray.toBlack = v;
+  else if (key == "towhite")
+    g_gray.toWhite = v;
+  else if (key == "a")
+    g_gray.a = v;
+  else if (key == "b")
+    g_gray.b = v;
+  else if (key == "c")
+    g_gray.c = v;
+  else if (key == "mod")
+    g_gray.modCode = static_cast<uint8_t>(value & 0x03);
+  else if (key == "scheme")
+    g_gray.scheme = v;
+  else if (key == "border")
+    g_gray.border = v;
+  else if (key == "ctrlcold")
+    g_gray.ctrlCold = v;
+  else if (key == "ctrlwarm")
+    g_gray.ctrlWarm = v;
+  else if (key == "vgh")
+    g_gray.vgh = v;
+  else if (key == "vsh1")
+    g_gray.vsh1 = v;
+  else if (key == "vsh2")
+    g_gray.vsh2 = v;
+  else if (key == "vsl")
+    g_gray.vsl = v;
+  else if (key == "vcom")
+    g_gray.vcom = v;
+  else if (key == "dclimit")
+    g_gray.dcLimit = v;
+  else if (key == "swing")
+    g_gray.satSwing = v;
+  else if (key == "pulldark")
+    g_gray.pullDark = v;
+  else if (key == "pulllight")
+    g_gray.pullLight = v;
+  else if (key == "frret")
+    g_gray.frRet = static_cast<uint8_t>(value & 0x0F);
+  else if (key == "pulseon")
+    g_gray.pulseOn = v;
+  else if (key == "pulseoff")
+    g_gray.pulseOff = v;
+  else if (key == "pulsecode")
+    g_gray.pulseCode = static_cast<uint8_t>(value & 0x03);
+  else if (key == "rampcode")
+    g_gray.rampCode = static_cast<uint8_t>(value & 0x03);
+  else if (key == "preup")
+    g_gray.preUp = v;
+  else if (key == "satwhite")
+    g_gray.satWhite = v;
+  else if (key == "grayfast")
+    g_gray.grayFast = v;
+  else if (key == "tgray")
+    g_gray.tGray = v;
+  else if (key == "tblack")
+    g_gray.tBlack = v;
+  else if (key == "dcevery")
+    g_gray.dcEvery = v;
+  else if (key == "stepaway")
+    g_gray.stepAway = v;
+  else if (key == "steptoward")
+    g_gray.stepToward = v;
+  else if (key == "stepcycles")
+    g_gray.stepCycles = v;
+  else if (key == "postclean")
+    g_gray.postClean = v;
+  else if (key == "lutdump")
+    g_lutDump = v != 0;
   // One knob for the whole balanced family: everything else follows from S.
   else if (key == "tri") {
     g_gray.preUp = v;
@@ -2242,7 +2271,8 @@ bool setGrayParam(const String& key, long value) {
     g_gray.tBlack = static_cast<uint8_t>(2 * v);
     g_gray.tGray = static_cast<uint8_t>(3 * v);
     g_gray.grayFast = 0;
-  } else return false;
+  } else
+    return false;
   return true;
 }
 
@@ -2296,7 +2326,8 @@ void probeFrameRates(uint8_t frames) {
     const Timing t = activateTimed(0xC7);
     const uint32_t perFrame = frames ? t.busyUs / frames : 0;
     Serial.printf("0x%X,%lu,%lu,%lu\n", code, static_cast<unsigned long>(t.busyUs),
-                  static_cast<unsigned long>(perFrame), static_cast<unsigned long>(perFrame ? 1000000UL / perFrame : 0));
+                  static_cast<unsigned long>(perFrame),
+                  static_cast<unsigned long>(perFrame ? 1000000UL / perFrame : 0));
   }
   Serial.println("=== probe done ===");
 }

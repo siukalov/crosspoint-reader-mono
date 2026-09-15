@@ -11,23 +11,14 @@
 HalStorage HalStorage::instance;
 
 HalStorage::HalStorage() {
-  // Recursive so the same task can re-enter StorageLock without self-deadlock.
-  // openFileForRead/Write take the lock and then assign to a HalFile&
-  // out-param; if that out-param already held an Impl, its destructor takes
-  // the lock again to close the prior FsFile under serialization (see
-  // HalFile::Impl::~Impl below). Priority inheritance still applies to
-  // recursive mutexes.
+  // Replacing a HalFile can close another handle under this lock.
   storageMutex = xSemaphoreCreateRecursiveMutex();
   assert(storageMutex != nullptr);
 }
 
-// begin() and ready() are only called from setup, no need to acquire mutex for them
-
 bool HalStorage::begin() { return SDCard.begin(); }
 
 bool HalStorage::ready() const { return SDCard.ready(); }
-
-// For the rest of the methods, we acquire the mutex to ensure thread safety
 
 class HalStorage::StorageLock {
  public:
@@ -62,12 +53,7 @@ bool HalStorage::ensureDirectoryExists(const char* path) { HAL_STORAGE_WRAPPED_C
 class HalFile::Impl {
  public:
   Impl(FsFile&& fsFile) : file(std::move(fsFile)) {}
-  // SdFat is not thread-safe; FsFile::close() touches SD/SPI and must run
-  // under StorageLock or it races SdSpiCard::m_spiActive across tasks and
-  // trips FreeRTOS's xTaskPriorityDisinherit assert. The FsFile member
-  // destructor (DESTRUCTOR_CLOSES_FILE=1) will close() again after the lock
-  // releases, but close() on an already-closed FsFile is a no-op. See SdFat
-  // issue #518 and the HAL note in CLAUDE.md.
+  // Closing a handle accesses shared SD state.
   ~Impl() {
     HalStorage::StorageLock lock;
     file.close();
@@ -90,9 +76,56 @@ bool HalStorage::mkdir(const char* path, const bool pFlag) { HAL_STORAGE_WRAPPED
 
 bool HalStorage::exists(const char* path) { HAL_STORAGE_WRAPPED_CALL(exists, path); }
 
+bool HalStorage::exists(const char* path, bool& result) {
+  StorageLock lock;
+  result = false;
+  if (!SDCard.ready() || path == nullptr || path[0] != '/') return false;
+  FsFile directory = SDCard.open("/", O_RDONLY);
+  if (!directory) return false;
+
+  const std::string fullPath(path);
+  std::string component;
+  size_t start = 1;
+  while (start < fullPath.size()) {
+    const size_t end = fullPath.find('/', start);
+    component.assign(fullPath, start, end - start);
+    if (!directory.isDirectory() || component.empty() || component == "." || component == "..") {
+      directory.close();
+      return false;
+    }
+    FsFile child;
+    const bool opened = child.open(&directory, component.c_str(), O_RDONLY);
+    const bool readOk = directory.getError() == 0;
+    const bool closed = directory.close();
+    if (!readOk || !closed) {
+      child.close();
+      return false;
+    }
+    if (!opened) return true;
+    directory = std::move(child);
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  if (!directory.close()) return false;
+  result = true;
+  return true;
+}
+
 bool HalStorage::remove(const char* path) { HAL_STORAGE_WRAPPED_CALL(remove, path); }
 bool HalStorage::rename(const char* oldPath, const char* newPath) {
   HAL_STORAGE_WRAPPED_CALL(rename, oldPath, newPath);
+}
+
+bool HalStorage::renameNoReplace(const char* oldPath, const char* newPath) {
+  StorageLock lock;
+  bool destinationExists = false;
+  if (!exists(newPath, destinationExists) || destinationExists) return false;
+  FsFile file = SDCard.open(oldPath, O_RDWR);
+  if (!file) return false;
+  const bool synced = !file.isDirectory() && file.sync();
+  const bool renamed = synced && file.rename(newPath);
+  const bool closed = file.close();
+  return renamed && closed;
 }
 
 bool HalStorage::rmdir(const char* path) { HAL_STORAGE_WRAPPED_CALL(rmdir, path); }
@@ -131,10 +164,6 @@ bool HalStorage::openFileForWrite(const char* moduleName, const String& path, Ha
 
 bool HalStorage::removeDir(const char* path) { HAL_STORAGE_WRAPPED_CALL(removeDir, path); }
 
-// HalFile implementation
-// Allow doing file operations while ensuring thread safety via HalStorage's mutex.
-// Please keep the list below in sync with the HalFile.h header
-
 #define HAL_FILE_WRAPPED_CALL(method, ...) \
   HalStorage::StorageLock lock;            \
   assert(impl != nullptr);                 \
@@ -145,6 +174,7 @@ bool HalStorage::removeDir(const char* path) { HAL_STORAGE_WRAPPED_CALL(removeDi
   return impl->file.method(__VA_ARGS__);
 
 void HalFile::flush() { HAL_FILE_WRAPPED_CALL(flush, ); }
+bool HalFile::sync() { HAL_FILE_WRAPPED_CALL(sync, ); }
 size_t HalFile::getName(char* name, size_t len) { HAL_FILE_WRAPPED_CALL(getName, name, len); }
 size_t HalFile::size() { HAL_FILE_FORWARD_CALL(size, ); }              // already thread-safe, no need to wrap
 size_t HalFile::fileSize() { HAL_FILE_FORWARD_CALL(fileSize, ); }      // already thread-safe, no need to wrap

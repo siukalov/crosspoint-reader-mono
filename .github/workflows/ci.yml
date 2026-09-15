@@ -91,13 +91,10 @@ jobs:
           restore-keys: pio-${{ runner.os }}-
 
       - name: Build CrossPoint
-        # Both envs in ONE pio invocation: a second `pio run` can wipe the whole
-        # .pio/build tree (project-checksum mismatch after the S3 toolchain
-        # installs into the restored cache), deleting the default firmware.bin
-        # before the artifact upload.
+        # Keep environments in one invocation to preserve firmware artifacts.
         run: |
           set -euo pipefail
-          pio run -e default -e sticky | tee pio.log
+          pio run -e default -e sticky -e paper_mono | tee pio.log
 
       - name: Extract firmware stats
 
@@ -127,6 +124,10 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -147,8 +148,6 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build/test --output-on-failure -j
 
-  # This job is used as the PR required actions check, allows for changes to other steps in the future without breaking
-  # PR requirements.
   test-status:
     name: Test Status
     needs:
@@ -160,7 +159,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Fail because needed jobs failed
-        # Fail if any job failed or was cancelled (skipped jobs are ok)
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: exit 1
       - name: Success

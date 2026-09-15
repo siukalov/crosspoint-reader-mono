@@ -21,7 +21,7 @@
 #include "fontIds.h"
 
 int HomeActivity::getMenuItemCount() const {
-  int count = 4;  // File Browser, Recents, File transfer, Settings
+  int count = 4;
   if (!recentBooks.empty()) {
     count += recentBooks.size();
   }
@@ -37,12 +37,10 @@ void HomeActivity::loadRecentBooks(int maxBooks) {
   recentBooks.reserve(std::min(static_cast<int>(books.size()), maxBooks));
 
   for (const RecentBook& book : books) {
-    // Limit to maximum number of recent books
     if (recentBooks.size() >= maxBooks) {
       break;
     }
 
-    // Skip if file no longer exists
     if (RecentBooksStore::isMissing(book)) {
       continue;
     }
@@ -61,13 +59,10 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     if (!book.coverBmpPath.empty()) {
       std::string coverPath = UITheme::getCoverThumbPath(book.coverBmpPath, coverHeight);
       if (!Storage.exists(coverPath.c_str())) {
-        // If epub, try to load the metadata for title/author and cover
         if (FsHelpers::hasEpubExtension(book.path)) {
           Epub epub(book.path, "/.crosspoint");
-          // Skip loading css since we only need metadata here
           epub.load(false, true);
 
-          // Try to generate thumbnail image for Continue Reading card
           if (!showingLoading) {
             showingLoading = true;
             popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
@@ -81,10 +76,8 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
           coverRendered = false;
           requestUpdate();
         } else if (FsHelpers::hasXtcExtension(book.path)) {
-          // Handle XTC file
           Xtc xtc(book.path, "/.crosspoint");
           if (xtc.load()) {
-            // Try to generate thumbnail image for Continue Reading card
             if (!showingLoading) {
               showingLoading = true;
               popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
@@ -119,42 +112,36 @@ void HomeActivity::onEnter() {
   const auto base = static_cast<int>(recentBooks.size());
   selectorIndex = initialMenuItem == HomeMenuItem::NONE ? 0 : base + menuItemToIndex(initialMenuItem, hasOpdsServers);
 
-  // Trigger first update
   requestUpdate();
 }
 
 void HomeActivity::onExit() {
   Activity::onExit();
 
-  // Free the stored cover buffer if any
   freeCoverBuffer();
 }
 
 bool HomeActivity::storeCoverBuffer() {
-  // render() must have already set the cover rect; without it we'd be back to
-  // cloning the whole framebuffer.
-  if (coverRectW <= 0 || coverRectH <= 0) return false;
   freeCoverBuffer();
-  const size_t needed = renderer.getRegionByteSize(coverRectX, coverRectY, coverRectW, coverRectH);
+  const size_t needed = renderer.regionSnapshotBytes(coverRectX, coverRectY, coverRectW, coverRectH);
   if (needed == 0) return false;
   coverBuffer = static_cast<uint8_t*>(malloc(needed));
   if (!coverBuffer) {
     LOG_ERR("HOME", "OOM: cover buffer (%u bytes)", (unsigned)needed);
     return false;
   }
-  coverBufferSize = needed;
-  if (!renderer.copyRegionToBuffer(coverRectX, coverRectY, coverRectW, coverRectH, coverBuffer, coverBufferSize)) {
-    free(coverBuffer);
-    coverBuffer = nullptr;
-    coverBufferSize = 0;
+  if (renderer.captureRegion(coverRectX, coverRectY, coverRectW, coverRectH, {coverBuffer, needed}, coverSnapshot) !=
+      GfxRenderer::FrameResult::Ok) {
+    freeCoverBuffer();
     return false;
   }
   return true;
 }
 
 bool HomeActivity::restoreCoverBuffer() {
-  if (!coverBuffer || coverRectW <= 0 || coverRectH <= 0) return false;
-  return renderer.copyBufferToRegion(coverRectX, coverRectY, coverRectW, coverRectH, coverBuffer, coverBufferSize);
+  if (coverBuffer && renderer.restoreRegion(coverSnapshot) == GfxRenderer::FrameResult::Ok) return true;
+  freeCoverBuffer();
+  return false;
 }
 
 void HomeActivity::freeCoverBuffer() {
@@ -162,8 +149,9 @@ void HomeActivity::freeCoverBuffer() {
     free(coverBuffer);
     coverBuffer = nullptr;
   }
-  coverBufferSize = 0;
+  coverSnapshot = {};
   coverBufferStored = false;
+  coverRendered = false;
 }
 
 void HomeActivity::loop() {
@@ -221,10 +209,6 @@ void HomeActivity::loop() {
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) backPressSeen = true;
 
-  // Back is otherwise unused on the home menu: open the most recently read
-  // book directly (recentBooks is most-recent-first and already pruned of
-  // files missing from the SD card). backPressSeen guards against the stale
-  // release of the Back press that closed the previous activity.
   if (mappedInput.wasReleased(MappedInputManager::Button::Back) && backPressSeen && !recentBooks.empty()) {
     onSelectBook(recentBooks[0].path);
     return;
@@ -252,9 +236,8 @@ void HomeActivity::loop() {
     if (menuRow < 0 || menuRow >= renderedMenuCount || (y - menuTop) % menuRowStep >= metrics.menuRowHeight) {
       return false;
     }
-    const int touchedIndex = metrics.homeContinueReadingInMenu
-                                 ? menuRow
-                                 : menuRow + static_cast<int>(recentBooks.size());
+    const int touchedIndex =
+        metrics.homeContinueReadingInMenu ? menuRow : menuRow + static_cast<int>(recentBooks.size());
     if (activate) {
       selectorIndex = touchedIndex;
       activateSelection();
@@ -265,9 +248,6 @@ void HomeActivity::loop() {
     return true;
   };
 
-  // Read each touch phase once, then route its coordinates. wasScreenTapped()
-  // is consumptive; asking the cover and menu helpers separately made the
-  // cover swallow every menu tap whenever a recent book existed.
   int tx = 0;
   int ty = 0;
   if (mappedInput.wasScreenTouchDown(tx, ty)) {
@@ -287,15 +267,18 @@ void HomeActivity::render(RenderLock&&) {
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
+  if (renderer.displayWorkAborted()) {
+    freeCoverBuffer();
+    return;
+  }
+  if (renderer.liveFrameNeedsRedraw()) freeCoverBuffer();
   renderer.clearScreen();
   bool bufferRestored = coverBufferStored && restoreCoverBuffer();
+  if (renderer.displayWorkAborted()) return;
 
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.homeTopPadding},
                  metrics.homeContinueReadingInMenu && !recentBooks.empty() ? recentBooks[0].title.c_str() : nullptr);
 
-  // Record the tile rect so storeCoverBuffer (called from the theme) knows
-  // which sub-region of the framebuffer to snapshot. ~16 KB in Portrait
-  // instead of the 48 KB full framebuffer the previous bind captured.
   coverRectX = 0;
   coverRectY = metrics.homeTopPadding;
   coverRectW = pageWidth;
@@ -305,7 +288,6 @@ void HomeActivity::render(RenderLock&&) {
                           recentBooks, selectorIndex, coverRendered, coverBufferStored, bufferRestored,
                           std::bind(&HomeActivity::storeCoverBuffer, this));
 
-  // Build menu items dynamically
   std::vector<const char*> menuItems = {tr(STR_BROWSE_FILES), tr(STR_MENU_RECENT_BOOKS), tr(STR_FILE_TRANSFER),
                                         tr(STR_SETTINGS_TITLE)};
   std::vector<UIIcon> menuIcons = {Folder, Recent, Transfer, Settings};
@@ -316,7 +298,6 @@ void HomeActivity::render(RenderLock&&) {
   }
 
   if (metrics.homeContinueReadingInMenu && !recentBooks.empty()) {
-    // Insert Continue Reading at the top if enabled in theme
     menuItems.insert(menuItems.begin(), tr(STR_CONTINUE_READING));
     menuIcons.insert(menuIcons.begin(), Book);
   }
@@ -336,10 +317,6 @@ void HomeActivity::render(RenderLock&&) {
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
 #if FREEINK_DEVICE_PAPERMONO
-  // First show Home through the ordinary OTP Fast path. When leaving a reader,
-  // submit the same Home frame once more as a forced all-pixel OTP update so the
-  // cleanup is a distinct, visible refresh instead of being merged into the
-  // reader-to-Home transition.
   const bool runPostEnterRefresh = refreshAfterEnter && firstRenderDone && !postEnterRefreshDone;
   renderer.displayBuffer(runPostEnterRefresh ? HalDisplay::FULL_REFRESH : HalDisplay::FAST_REFRESH);
   if (runPostEnterRefresh) postEnterRefreshDone = true;

@@ -43,9 +43,7 @@ void IntervalSelectionActivity::onEnter() {
   requestUpdate();
 }
 
-void IntervalSelectionActivity::adjustValue(const int delta) {
-  setValue(value + delta);
-}
+void IntervalSelectionActivity::adjustValue(const int delta) { setValue(value + delta); }
 
 void IntervalSelectionActivity::setValue(const int candidate) {
   const int next = clampedValue(candidate);

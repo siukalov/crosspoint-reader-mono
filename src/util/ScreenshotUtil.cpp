@@ -6,11 +6,13 @@
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <Logging.h>
+#include <esp_heap_caps.h>
 
 #include <cstring>
+#include <memory>
 #include <string>
 
-#include "Bitmap.h"  // Required for BmpHeader struct definition
+#include "Bitmap.h"
 #include "activities/Activity.h"
 
 void ScreenshotUtil::buildFilename(const ScreenshotInfo& info, char* buf, size_t bufSize) {
@@ -32,7 +34,6 @@ void ScreenshotUtil::buildFilename(const ScreenshotInfo& info, char* buf, size_t
   if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
 
-  // Display spine index as 1-based for user-facing filenames
   const int chapterNum = info.spineIndex + 1;
 
   if (info.readerType == ScreenshotInfo::ReaderType::Epub && info.spineIndex >= 0) {
@@ -68,6 +69,11 @@ void ScreenshotUtil::buildFilename(const ScreenshotInfo& info, char* buf, size_t
 }
 
 void ScreenshotUtil::takeScreenshot(GfxRenderer& renderer) {
+  if (!renderer.canCaptureLiveFrame()) {
+    LOG_ERR("SCR", "Live framebuffer not available");
+    return;
+  }
+
   const uint8_t* fb = renderer.getFrameBuffer();
   if (!fb) {
     LOG_ERR("SCR", "Framebuffer not available");
@@ -86,19 +92,36 @@ void ScreenshotUtil::takeScreenshot(GfxRenderer& renderer) {
     return;
   }
 
-  // Display a border around the screen to indicate a screenshot was taken
-  if (renderer.storeBwBuffer()) {
-    int marginTop, marginRight, marginBottom, marginLeft;
-    renderer.getOrientedViewableTRBL(&marginTop, &marginRight, &marginBottom, &marginLeft);
-    int width = renderer.getScreenWidth() - marginLeft - marginRight - 1;
-    int height = renderer.getScreenHeight() - marginTop - marginBottom - 1;
-    // Add extra margin to the border to make it more visible
-    renderer.drawRect(marginLeft + 1, marginTop + 1, width - 2, height - 2, 2, true);
-    renderer.displayBuffer();
-    delay(1000);
-    renderer.restoreBwBuffer();
-    renderer.displayBuffer(HalDisplay::RefreshMode::HALF_REFRESH);
+  const size_t snapshotBytes = renderer.frameSnapshotBytes();
+  std::unique_ptr<uint8_t, decltype(&heap_caps_free)> snapshotStorage(
+      static_cast<uint8_t*>(heap_caps_malloc(snapshotBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)), heap_caps_free);
+  if (!snapshotStorage) {
+    LOG_ERR("SCR", "Screenshot feedback allocation failed");
+    return;
   }
+
+  GfxRenderer::FrameSnapshot snapshot;
+  if (renderer.captureFrame({snapshotStorage.get(), snapshotBytes}, snapshot) != GfxRenderer::FrameResult::Ok) {
+    LOG_ERR("SCR", "Screenshot feedback capture failed");
+    return;
+  }
+
+  int marginTop, marginRight, marginBottom, marginLeft;
+  renderer.getOrientedViewableTRBL(&marginTop, &marginRight, &marginBottom, &marginLeft);
+  int width = renderer.getScreenWidth() - marginLeft - marginRight - 1;
+  int height = renderer.getScreenHeight() - marginTop - marginBottom - 1;
+  renderer.drawRect(marginLeft + 1, marginTop + 1, width - 2, height - 2, 2, true);
+  renderer.displayBuffer();
+  delay(1000);
+  if (!renderer.canCaptureLiveFrame()) {
+    LOG_DBG("SCR", "Screenshot feedback cancelled");
+    return;
+  }
+  if (renderer.replaceFrame(snapshot) != GfxRenderer::FrameResult::Ok || !renderer.canCaptureLiveFrame()) {
+    LOG_ERR("SCR", "Screenshot feedback restore failed");
+    return;
+  }
+  renderer.displayBuffer(HalDisplay::RefreshMode::HALF_REFRESH);
 }
 
 bool ScreenshotUtil::saveFramebufferAsBmp(const char* filename, const uint8_t* framebuffer, int width, int height) {

@@ -496,32 +496,32 @@ void SettingsActivity::openSleepTimeoutPicker() {
 
 void SettingsActivity::openFrontlightBrightnessPicker() {
 #if FREEINK_DEVICE_PAPERMONO
-  startActivityForResult(
-      std::make_unique<IntervalSelectionActivity>(
-          renderer, mappedInput, "FrontlightBrightness", StrId::STR_FRONTLIGHT_BRIGHTNESS,
-          SETTINGS.frontlightBrightness, 0, 100, 5, 20, StrId::STR_PERCENT_VALUE_FORMAT, false, true,
-          StrId::STR_NONE_OPT,
-          [](const int value) {
-            // Track the setting, not just the panel: what the user is looking at
-            // IS the brightness, so the stored value must never lag behind it.
-            SETTINGS.frontlightBrightness = static_cast<uint8_t>(value);
-            if (!PaperMonoBoard::fadeFrontlightTo(static_cast<uint8_t>(value), 80)) {
-              LOG_ERR("SET", "Frontlight live update failed at %d%%", value);
-            }
-          },
-          true),
-      [this](const ActivityResult& result) {
-        if (!result.isCancelled) {
-          SETTINGS.frontlightBrightness = static_cast<uint8_t>(std::get<IntervalResult>(result.data).value);
-          if (!PaperMonoBoard::fadeFrontlightTo(SETTINGS.frontlightBrightness, 120)) {
-            LOG_ERR("SET", "Frontlight confirmation failed at %u%%", SETTINGS.frontlightBrightness);
-          }
-          if (!SETTINGS.saveToFile()) {
-            LOG_ERR("SET", "Failed to save frontlight brightness");
-          }
-        }
-        requestUpdate();
-      });
+  startActivityForResult(std::make_unique<IntervalSelectionActivity>(
+                             renderer, mappedInput, "FrontlightBrightness", StrId::STR_FRONTLIGHT_BRIGHTNESS,
+                             SETTINGS.frontlightBrightness, 0, 100, 5, 20, StrId::STR_PERCENT_VALUE_FORMAT, false, true,
+                             StrId::STR_NONE_OPT,
+                             [](const int value) {
+                               // Track the setting, not just the panel: what the user is looking at
+                               // IS the brightness, so the stored value must never lag behind it.
+                               SETTINGS.frontlightBrightness = static_cast<uint8_t>(value);
+                               if (!PaperMonoBoard::fadeFrontlightTo(static_cast<uint8_t>(value), 80)) {
+                                 LOG_ERR("SET", "Frontlight live update failed at %d%%", value);
+                               }
+                             },
+                             true),
+                         [this](const ActivityResult& result) {
+                           if (!result.isCancelled) {
+                             SETTINGS.frontlightBrightness =
+                                 static_cast<uint8_t>(std::get<IntervalResult>(result.data).value);
+                             if (!PaperMonoBoard::fadeFrontlightTo(SETTINGS.frontlightBrightness, 120)) {
+                               LOG_ERR("SET", "Frontlight confirmation failed at %u%%", SETTINGS.frontlightBrightness);
+                             }
+                             if (!SETTINGS.saveToFile()) {
+                               LOG_ERR("SET", "Failed to save frontlight brightness");
+                             }
+                           }
+                           requestUpdate();
+                         });
 #endif
 }
 
