@@ -1,8 +1,8 @@
 diff --git a/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp b/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp
-index c79227b..a7e083a 100644
+index c79227b..522439e 100644
 --- a/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp
 +++ b/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp
-@@ -7,6 +7,12 @@
+@@ -7,12 +7,15 @@
  #include <array>
  #include <cstring>
  
@@ -11,11 +11,166 @@ index c79227b..a7e083a 100644
 +                                            uint32_t offset, const uint8_t* data, uint16_t count) __attribute__((weak));
 +extern "C" void freeink_panel_capture_activation(uint8_t control, uint32_t generation, uint32_t busyMs)
 +    __attribute__((weak));
++extern "C" void freeink_panel_capture_completion(uint8_t control, uint32_t generation, uint32_t busyMs, bool completed)
++    __attribute__((weak));
 +
  #if FREEINK_WAVEFORM_LAB && __has_include("PaperMonoWaveformBaked.h")
- // Optional waveform-editor export ("bake"): defines PAPER_MONO_WAVEFORM_BAKED_PAGE
- // and optionally _CORRECTIVE/_STAGE2 as uint8_t[111] arrays. The baked set
-@@ -373,32 +379,37 @@ void Ssd1683Driver::resetRamCounter(EpdBus& bus) {
+-// Optional waveform-editor export ("bake"): defines PAPER_MONO_WAVEFORM_BAKED_PAGE
+-// and optionally _CORRECTIVE/_STAGE2 as uint8_t[111] arrays. The baked set
+-// replaces the built-in generated waveform only while no runtime lab override
+-// is active; delete the file and rebuild to return to stock. Absent file =
+-// this block does not exist.
+ #include "PaperMonoWaveformBaked.h"
+ #endif
+ 
+@@ -27,17 +30,9 @@ constexpr uint16_t WIDTH_BYTES = WIDTH / 8;
+ constexpr uint32_t BUFFER_SIZE = static_cast<uint32_t>(WIDTH_BYTES) * HEIGHT;
+ constexpr uint16_t ROTATE_CHUNK_BYTES = 16384;
+ 
+-// Display Update Control 2. A custom trigger must omit the OTP LUT and
+-// temperature reload bits 0x10/0x20 -- either one silently replaces the
+-// injected waveform with the vendor's. 0xCC brings the analog rails up and
+-// leaves them up, 0x0C reuses rails that are already live, 0x03 shuts them
+-// down once ActivityManager proves the controller queue is empty.
+ constexpr uint8_t CTRL_CUSTOM_HOLD_COLD = 0xCC;
+ constexpr uint8_t CTRL_DISPLAY_HOLD_WARM = 0x0C;
+ constexpr uint8_t CTRL_POWER_OFF = 0x03;
+-// Paper Mono's internal non-flashing B/W waveform, with LUT and temperature
+-// reload but without the trailing analog/clock power-down. Repeated UI updates
+-// can then reuse the resident OTP LUT through 0x0C.
+ constexpr uint8_t CTRL_OTP_BW_HOLD = 0xFC;
+ 
+ // Source driving voltage selectors inside a LUT phase, two bits per sub-phase.
+@@ -45,38 +40,15 @@ constexpr uint8_t VS_BLACK = 0x01;  // VSH1, +15 V
+ constexpr uint8_t VS_WHITE = 0x02;  // VSL,  -15 V
+ constexpr uint8_t VS_WEAK = 0x03;   // VSH2, +5 V
+ 
+-// Frame-rate code 0x08 is 5000 us/frame, the fastest the controller offers.
+-// Every timing in this file is expressed in those frames.
+ constexpr uint8_t FRAME_RATE_CODE = 0x08;
+ 
+-// Lab-validated analog set for this glass, written on every custom LUT load
+-// exactly like the panel lab's loadLut(). The whole tone model -- the 10-frame
+-// strong-rail swing, the 60-frame weak-rail swing, every balance sum in
+-// makeTriLut() -- was measured under these values. An earlier build preserved
+-// the module's OTP analog bank instead; that was never on glass in the lab,
+-// and shipped with no middle tone (unknown VSH2 made the weak develop do
+-// nothing, so AA edges stayed white) and a tinted background (unknown
+-// VSL/VCOM).
+ constexpr uint8_t VOLT_VGH = 0x17;   // gate high
+ constexpr uint8_t VOLT_VSH1 = 0x41;  // +15 V strong black rail
+ constexpr uint8_t VOLT_VSH2 = 0xA8;  // +5 V weak rail, the middle tone's rail
+ constexpr uint8_t VOLT_VSL = 0x32;   // -15 V strong white rail
+ constexpr uint8_t VOLT_VCOM = 0x30;  // common electrode DC
+ 
+-// Measured: the strong rail covers the full optical swing in about ten frames.
+-// A class whose white phase is shorter than this is no longer guaranteed to
+-// land on the same shade regardless of where it started.
+ constexpr uint16_t SAT_MIN_FRAMES = 12;
+-// Entry 0 used to carry a white-biased background top-up (one +15 V frame then
+-// a 5-frame white dose) so that unchanged white lost a little residue on every
+-// page turn. It is gone: entry 0 now also holds unchanged *black*, and that dose
+-// visibly bleached held glyphs over a few pages. Residue is handled where it can
+-// be aimed instead -- the packed erase wipe in makeTriLut() and the corrective
+-// sweep.
+-// Paper Mono's 180-degree mount requires a reversed staging buffer. Keep one
+-// controller-worker-owned block in internal RAM: larger bursts cut the Arduino
+-// SPI transaction setup count from 94 to 3 per plane without consuming the
+-// render task's 8 KB stack.
+ DRAM_ATTR uint8_t ROTATE_CHUNK[ROTATE_CHUNK_BYTES];
+ 
+ constexpr std::array<uint8_t, 256> makeReverseBitsLut() {
+@@ -91,26 +63,12 @@ constexpr std::array<uint8_t, 256> makeReverseBitsLut() {
+ }
+ constexpr auto REVERSE_BITS_LUT = makeReverseBitsLut();
+ 
+-// Xtensa has no population-count instruction, so __builtin_popcount lowers to a
+-// windowed callx8 into ROM's __popcountsi2 (verified in the linked ELF). The
+-// plane-composition loops below run it once per framebuffer byte, which is tens
+-// of thousands of function calls per page turn purely to feed a serial-log
+-// statistic. This SWAR form inlines to a handful of register ops and needs no
+-// table, so the counters stay exact and cost effectively nothing.
+ constexpr uint8_t popcount8(uint8_t value) {
+   value = static_cast<uint8_t>(value - ((value >> 1) & 0x55u));
+   value = static_cast<uint8_t>((value & 0x33u) + ((value >> 2) & 0x33u));
+   return static_cast<uint8_t>((value + (value >> 4)) & 0x0Fu);
+ }
+ 
+-// The SSD1677 waveform block. Bytes 0..104 go out via cmd 0x32; the analog
+-// tail 105..109 goes out as the VOLT_* register writes in loadCustomLut():
+-//   [0..49]    five LUT entries x ten groups; each byte is four sub-phases at
+-//              two bits, phase A in the most significant pair
+-//   [50..99]   ten groups x {TP_A, TP_B, TP_C, TP_D, RP}; a group runs RP+1
+-//              times, so RP counts *extra* repeats
+-//   [100..104] frame-rate nibbles, two groups per byte
+-//   [105..109] VGH, VSH1, VSH2, VSL, VCOM (registers 0x03/0x04/0x2C)
+ struct WaveLut {
+   uint8_t b[111];
+ 
+@@ -196,8 +154,6 @@ void Ssd1683Driver::waveLabClear(uint8_t slot) {
+ 
+ bool Ssd1683Driver::waveLabGet(uint8_t slot, uint8_t out[WAVELAB_LUT_BYTES]) const {
+   if (slot > WAVELAB_SLOT_CORRECTIVE || !out) return false;
+-  // Corrective mirrors runUpdate()'s fallback: its own slot, else PAGE, else
+-  // the built-in waveform.
+   uint8_t effective = slot;
+   if (slot == WAVELAB_SLOT_CORRECTIVE && !(_labActive & (1u << WAVELAB_SLOT_CORRECTIVE)) &&
+       (_labActive & (1u << WAVELAB_SLOT_PAGE))) {
+@@ -208,8 +164,6 @@ bool Ssd1683Driver::waveLabGet(uint8_t slot, uint8_t out[WAVELAB_LUT_BYTES]) con
+     return true;
+   }
+ #ifdef PAPER_MONO_WAVEFORM_BAKED_PAGE
+-  // With no runtime slot active the baked set is what actually runs next;
+-  // report those bytes (returning false: not a runtime override).
+   if (_labActive == 0) {
+     const uint8_t* baked = nullptr;
+     if (slot == WAVELAB_SLOT_STAGE2) {
+@@ -231,10 +185,6 @@ bool Ssd1683Driver::waveLabGet(uint8_t slot, uint8_t out[WAVELAB_LUT_BYTES]) con
+     }
+   }
+ #endif
+-  // Built-in fallback: the generated stock waveform. makeTriLut()/
+-  // makePostCleanLut() leave bytes 105..109 zero because loadCustomLut()
+-  // writes the VOLT_* constants directly; report those constants so the
+-  // editor sees the analog set the waveform actually runs under.
+   if (slot == WAVELAB_SLOT_STAGE2) {
+     makePostCleanLut(out);
+   } else {
+@@ -252,9 +202,6 @@ uint16_t Ssd1683Driver::labSelectPageLut(bool corrective, uint8_t out[WAVELAB_LU
+                                          const uint8_t** labVolts) const {
+   *labVolts = nullptr;
+   const uint8_t* src = nullptr;
+-  // A runtime override set governs completely; the baked set only applies as a
+-  // coherent whole while no runtime slot is active. Mixing the two would make
+-  // "which stage 2 runs" depend on edit order.
+   if (_labActive != 0) {
+     if (corrective && (_labActive & (1u << WAVELAB_SLOT_CORRECTIVE))) {
+       src = _labLut[WAVELAB_SLOT_CORRECTIVE];
+@@ -293,8 +240,6 @@ bool Ssd1683Driver::allocateBuffers() {
+   const bool ok = alloc(_lastBw, BUFFER_SIZE) && alloc(_pendingBw, BUFFER_SIZE) && alloc(_grayLsb, BUFFER_SIZE) &&
+                   alloc(_grayMsb, BUFFER_SIZE) && alloc(_glassNonWhite, BUFFER_SIZE) &&
+                   alloc(_glassBlack, BUFFER_SIZE) && alloc(_sel24, BUFFER_SIZE) && alloc(_sel26, BUFFER_SIZE);
+-  // An unknown glass state must never be diffed against. Start it at "all
+-  // white" and let _needsFull force the first waveform to drive every pixel.
+   if (glassWasMissing && ok) {
+     memset(_glassNonWhite, 0, BUFFER_SIZE);
+     memset(_glassBlack, 0, BUFFER_SIZE);
+@@ -330,14 +275,9 @@ void Ssd1683Driver::initController(EpdBus& bus) {
+   bus.data(static_cast<uint8_t>((HEIGHT - 1) & 0xFF));
+   bus.data(static_cast<uint8_t>((HEIGHT - 1) >> 8));
+   bus.data(0x02);
+-  // Keep the border on VCOM, as used by the panel-lab characterisation. On the
+-  // SSD1677 A[7:6]=10 means VCOM; actual HiZ would be 0xC0.
+   bus.cmd(0x3C);
+   bus.data(0x80);
+   bus.cmd(0x11);
+-  // Keep the controller in Paper Mono's validated X-/Y+ scan layout. The panel
+-  // mount needs this controller-side X direction in addition to writePlane()'s
+-  // raster transform; X+/Y+ adds a visible left/right mirror on this hardware.
+   bus.data(0x02);
+ 
+   bus.cmd(0x44);
+@@ -373,32 +313,42 @@ void Ssd1683Driver::resetRamCounter(EpdBus& bus) {
  
  void Ssd1683Driver::writePlane(EpdBus& bus, uint8_t command, const uint8_t* data) {
    if (!data) return;
@@ -52,7 +207,935 @@ index c79227b..a7e083a 100644
    bus.cmd(0x20);
 +  const uint32_t started = capture ? millis() : 0;
    bus.waitRefreshComplete("SSD1683 refresh");
-+  if (capture) freeink_panel_capture_activation(control, _renderGeneration, millis() - started);
++  if (capture) {
++    const uint32_t busyMs = millis() - started;
++    freeink_panel_capture_activation(control, _renderGeneration, busyMs);
++    if (freeink_panel_capture_completion)
++      freeink_panel_capture_completion(control, _renderGeneration, busyMs, !bus.isBusy());
++  }
  }
  
  void Ssd1683Driver::activateOtp(EpdBus& bus) {
+@@ -416,9 +366,6 @@ void Ssd1683Driver::powerOffController(EpdBus& bus) {
+ 
+ void Ssd1683Driver::loadCustomLut(EpdBus& bus, const uint8_t lut[111]) {
+ #if FREEINK_WAVEFORM_LAB
+-  // A lab override carries its own analog tail in bytes 105..109. With no
+-  // override in flight (_labVolts == nullptr) the writes below are the exact
+-  // stock sequence.
+   if (_labVolts) {
+     bus.cmd(0x32);
+     bus.data(lut, 105);
+@@ -434,9 +381,6 @@ void Ssd1683Driver::loadCustomLut(EpdBus& bus, const uint8_t lut[111]) {
+ #endif
+   bus.cmd(0x32);
+   bus.data(lut, 105);
+-  // The analog registers are volatile across reset/deep-sleep, and the OTP
+-  // paths reload their own WS-bank values on every 0xFC trigger, so the custom
+-  // set must be re-asserted with the LUT every time.
+   bus.cmd(0x03);
+   bus.data(VOLT_VGH);
+   static constexpr uint8_t source[3] = {VOLT_VSH1, VOLT_VSH2, VOLT_VSL};
+@@ -446,13 +390,6 @@ void Ssd1683Driver::loadCustomLut(EpdBus& bus, const uint8_t lut[111]) {
+   _lutState = LutState::Custom;
+ }
+ 
+-// Endpoint polish. On ordinary pages entry 0 is unchanged white and entry 1 is
+-// changed-to-white; both therefore receive the same white schedule. Gray and
+-// black stay on entries 2 and 3. Every entry receives the same number of VSH1
+-// and VSL frames, so the source impulse remains class-independent. Phase order
+-// is the only difference: white alternates to avoid a visible dark hold, gray
+-// makes a closed local excursion, and black groups its release before one
+-// continuous black settle instead of bleaching the endpoint on every repeat.
+ uint16_t Ssd1683Driver::makePostCleanLut(uint8_t out[111]) const {
+   WaveLut lut;
+   lut.clear();
+@@ -483,58 +420,10 @@ uint16_t Ssd1683Driver::makePostCleanLut(uint8_t out[111]) const {
+   return totalFrames;
+ }
+ 
+-// The one-shot three-level waveform used for every Balanced page. G0 is the
+-// activation kick: the driven classes charge toward their anti-target rail
+-// (white and gray toward black, black toward white). The remaining per-class
+-// trajectories are right-aligned so white, gray and black all finish on their
+-// target rail; a left-aligned layout made endpoints look gray because they
+-// idled at VSS after finishing early.
+-//
+-// Entry 0 is idle throughout. It is the hold entry for both unchanged white and
+-// unchanged black (see runUpdate()), so any charge placed on it would drift the
+-// pixels the page never meant to touch -- a background top-up here bleached
+-// held black. Background residue is instead handled by the packed erase below
+-// and by the corrective sweep.
+-//
+-// Gray takes its own kick length, kG, independent of the shared k. Charging it
+-// the FULL k (which is what the shared kick group used to do) is what the eye
+-// reads as the page "previewing itself": every target-gray pixel is driven from
+-// frame 0 whether it changed or not (see runUpdate()'s alwaysDriven), and gray
+-// is exactly the antialiased outline of the NEXT page's glyphs. k=12 is 120% of
+-// a full swing, so those outlines slam to solid black, get wiped white by the
+-// reset, and only then develop -- the reported "ghost, then blank, then the
+-// page". kG is instead the smallest kick that still lets the white reset reach
+-// a full swing, so the outline barely greys before it settles.
+-//
+-//   white: +15*k  - 15*whiteW              = 0  ->  whiteW = k
+-//   gray:  +15*kG - 15*grayW  +  5*tGray   = 0  ->  grayW  = kG + tGray/3
+-//   black: -15*k  - 15*blackW + 15*tBlack  = 0  ->  blackW = tBlack - k
+-//
+-// setGrayParams() picks kG = max(0, GRAY_RESET_FRAMES - tGray/3), i.e. it buys
+-// exactly the reset it needs and no more. The retired alternative was kG = 0
+-// with grayW = tGray/3, which forced tGray >= 3*GRAY_RESET_FRAMES and an
+-// ~80%-black "gray" that reads as black on thin CJK strokes; deriving kG keeps
+-// the middle tone wherever lightFrames put it.
+-//
+-// Ordinary pages run k=12, kG=2, tGray=24, tBlack=24: trajectories W=12,
+-// G=10+24 and B=12+24 right-aligned in a 36-frame tail, 48 frames / 240 ms
+-// total. The reverse swing -- the interval in which target black is being held
+-// at the white rail, which is what the eye reads as the page "flashing" -- is a
+-// quarter shorter than the 16/32 profile it replaces, while the middle tone
+-// still lands at ~40% of the weak-rail swing because tGray is untouched.
+-//
+-// The erase class additionally uses `packedErase`: instead of idling out the
+-// middle of the tail and wiping for k frames, it recharges toward black for k
+-// frames and then wipes for 2k. The net impulse is identical (still zero) but
+-// the wipe carries twice the dose, and the away-then-toward order is what
+-// clears the residual ghost that solid black areas otherwise leave behind.
+ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
+   TriParams p = _tri;
+   if (corrective) {
+     p.preUp = CORRECTIVE_PRE_UP;
+-    // Gray takes the full kick here. The pre-flash kG exists to suppress is a
+-    // page-turn artifact; a corrective sweep is a deliberate full-swing reset of
+-    // every pixel, and the middle tone is the one that most needs re-anchoring.
+     p.grayKick = CORRECTIVE_PRE_UP;
+     p.tBlack = CORRECTIVE_T_BLACK;
+     p.packedErase = false;
+@@ -553,10 +442,6 @@ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
+   uint8_t group = 0;
+   uint16_t frames = 0;
+ 
+-  // Activation kick. Gray leaves it early (grayKick <= kick), so the kick is
+-  // emitted as up to two groups: the shared head with entry 2 on the black rail,
+-  // then the remainder with entry 2 idle. grayKick == kick collapses to the
+-  // single group this used to be; grayKick == 0 drops the head entirely.
+   if (grayKick > 0) {
+     lut.setVs(1, group, 0, VS_BLACK);
+     lut.setVs(2, group, 0, VS_BLACK);
+@@ -585,17 +470,10 @@ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
+       static_cast<uint16_t>(tail - trajectory[2]),
+   };
+ 
+-  // Erase class layout. Unpacked it idles and then wipes for whiteFor[0] = k
+-  // frames ending at `tail`. Packed it prepends a k-frame recharge toward
+-  // black, which doubles the wipe to 2k; that needs a 3k-frame tail, and with
+-  // any tGray large enough to be a visible middle tone the gray trajectory
+-  // already provides it. Falls back to the unpacked layout if it does not.
+   const uint16_t erasePack = (p.packedErase && tail >= 3u * kick) ? kick : 0u;
+   const uint16_t eraseWipeStart = static_cast<uint16_t>(tail - whiteFor[0] - erasePack);
+   const uint16_t erasePackStart = static_cast<uint16_t>(eraseWipeStart - erasePack);
+ 
+-  // Every boundary at which a class changes voltage. Between two consecutive
+-  // boundaries all entries have a constant source selection and fit one group.
+   uint16_t bounds[8] = {
+       0,
+       erasePackStart,
+@@ -640,12 +518,6 @@ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
+   return frames;
+ }
+ 
+-// Binary UI and the reader's Fast mode stay on the panel's own temperature-
+-// selected, non-flashing OTP waveform. The host glass model is still used to
+-// synthesize the OLD plane: a physical gray has no exact binary OLD value, so
+-// force it to the endpoint opposite the target and make the OTP transition
+-// definite. `forceAll` does the same for every pixel when the glass history is
+-// unknown or the caller explicitly requests a full resync.
+ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forceAll) {
+   if (!bwTarget || !allocateBuffers()) return false;
+   if (!_initialized) {
+@@ -653,11 +525,6 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
+     initController(bus);
+   }
+ 
+-  // Only "did anything change at all" gates the update; the exact bit count is
+-  // a log statistic. __builtin_popcount does not inline on Xtensa — it compiles
+-  // to a windowed callx8 into ROM's __popcountsi2 — so accumulating it per byte
+-  // cost one function call per byte of the framebuffer on every refresh. OR the
+-  // masks together instead, and pay for popcount only when a log will print it.
+   uint8_t changedBits = 0;
+ #ifdef ENABLE_SERIAL_LOG
+   uint32_t changed = 0;
+@@ -683,19 +550,17 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
+     changed += popcount8(changedMask);
+ #endif
+ 
+-    // SSD1677 OTP B/W: one means old white, zero means old black. For gray,
+-    // choose the opposite of the target so the controller cannot classify it
+-    // as an unchanged endpoint.
+     const uint8_t oldWhite = static_cast<uint8_t>(~oldNonWhite);
+     _sel26[i] = static_cast<uint8_t>(oldWhite | (static_cast<uint8_t>(~bw) & oldGray));
+   }
+-  if (changedBits == 0) return false;
++  if (changedBits == 0 || displayWorkCancelled()) return false;
+ 
+   const unsigned long started = millis();
+   bus.cmd(0x3C);
+   bus.data(0x80);  // VCOM border; do not let the custom LUT drive a dark rim.
+   writePlane(bus, CMD_WRITE_NEW, bwTarget);
+   writePlane(bus, CMD_WRITE_OLD, _sel26);
++  if (displayWorkCancelled()) return false;
+   activateOtp(bus);
+ 
+   for (uint32_t i = 0; i < BUFFER_SIZE; ++i) {
+@@ -703,10 +568,7 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
+     _glassNonWhite[i] = black;
+     _glassBlack[i] = black;
+   }
+-  _panelHasGray = false;
+ 
+-  // Fires on every B/W refresh, i.e. every page turn. Diagnostic only -- see
+-  // FREEINK_EPD_TIMING_LOG below.
+ #if FREEINK_EPD_TIMING_LOG
+   Serial.printf("[%lu] SSD1677 OTP B/W: changed=%lu forced=%u elapsed=%lums\n", millis(),
+                 static_cast<unsigned long>(changed), static_cast<unsigned>(forceAll), millis() - started);
+@@ -718,197 +580,182 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
+   return true;
+ }
+ 
+-bool Ssd1683Driver::runUpdate(EpdBus& bus, const uint8_t* bwTarget, bool useGray, bool corrective) {
+-  if (!useGray) {
+-    const bool otpRan = runOtpUpdate(bus, bwTarget, corrective);
+-    if (otpRan) _displayCommitted = true;
+-    return otpRan;
++void Ssd1683Driver::invalidateController() {
++  _initialized = false;
++  _controllerPowered = false;
++  _lutState = LutState::Unknown;
++}
++
++bool Ssd1683Driver::waitVendorReady(EpdBus& bus, bool refresh, uint8_t control) {
++  delay(1);
++  const uint32_t started = millis();
++  if (refresh)
++    bus.waitRefreshComplete("SSD1677 vendor refresh");
++  else
++    bus.waitBusy("SSD1677 vendor reset");
++  const bool completed = !bus.isBusy();
++  if (refresh && freeink_panel_capture_enabled && freeink_panel_capture_enabled()) {
++    const uint32_t busyMs = millis() - started;
++    if (freeink_panel_capture_activation) freeink_panel_capture_activation(control, _renderGeneration, busyMs);
++    if (freeink_panel_capture_completion)
++      freeink_panel_capture_completion(control, _renderGeneration, busyMs, completed);
+   }
+-  if (!bwTarget || !allocateBuffers()) return false;
+-  if (!_initialized) {
+-    bus.reset();
+-    initController(bus);
++  if (!completed) {
++    _needsFull = true;
++    _needsBwRecovery = true;
++    invalidateController();
+   }
++  return completed;
++}
+ 
+-  // q24 means non-white and q26 means black, so level = q24 + q26 gives
+-  // W=0, G=1, B=2. A corrective update maps every pixel to target-coded entry
+-  // W=1, G=2, B=3. On an ordinary page only changed pixels and target gray are
+-  // driven; unchanged white and unchanged black both hold on the idle entry 0.
+-  // Holding white removes the dominant full-background flash, and holding black
+-  // removes the whiteout on glyphs shared by two consecutive pages -- those
+-  // pixels used to be re-anchored through the anti-target reset, i.e. driven to
+-  // white and back, which reads as the text blinking out. Unchanged gray stays
+-  // driven because the middle tone is the drift-fragile one.
+-  // See runOtpUpdate(): popcount is a ROM call on Xtensa, and both counters are
+-  // log-only — `changed` is otherwise tested just for zero, `driven` is never
+-  // read at all. Keeping them out of the release build removes two calls per
+-  // framebuffer byte from the hottest loop in a gray page turn.
+-  uint8_t changedBits = 0;
+-#ifdef ENABLE_SERIAL_LOG
+-  uint32_t changed = 0;
+-  uint32_t driven = 0;
+-#endif
+-  for (uint32_t i = 0; i < BUFFER_SIZE; ++i) {
+-    const uint8_t bw = bwTarget[i];  // set bit = white
+-    const uint8_t gray = useGray ? static_cast<uint8_t>(_grayLsb[i] | _grayMsb[i]) : 0u;
+-    const uint8_t q24 = static_cast<uint8_t>(gray | ~bw);
+-    const uint8_t q26 = static_cast<uint8_t>(~bw & ~gray);
+-    const uint8_t old24 = _glassNonWhite[i];
+-    const uint8_t old26 = _glassBlack[i];
+-    const uint8_t changedMask = static_cast<uint8_t>((old24 ^ q24) | (old26 ^ q26));
+-    // Unconditionally driven on an ordinary page: target gray when black is
+-    // held, otherwise everything non-white.
+-    const uint8_t alwaysDriven = _holdUnchangedBlack ? static_cast<uint8_t>(q24 & ~q26) : q24;
+-    const uint8_t driveMask = corrective ? 0xFFu : static_cast<uint8_t>(changedMask | alwaysDriven);
+-    changedBits |= corrective ? 0xFFu : changedMask;
+-#ifdef ENABLE_SERIAL_LOG
+-    changed += corrective ? 8u : popcount8(changedMask);
+-    driven += popcount8(driveMask);
+-#endif
+-    _sel24[i] = static_cast<uint8_t>(driveMask & ~(q24 ^ q26));
+-    _sel26[i] = static_cast<uint8_t>(driveMask & q24);
++bool Ssd1683Driver::initVendor(EpdBus& bus, bool gray) {
++  invalidateController();
++  bus.reset();
++  if (!waitVendorReady(bus, false)) return false;
++  bus.cmd(CMD_SOFT_RESET);
++  delay(10);
++  if (!waitVendorReady(bus, false)) return false;
++  if (!gray) {
++    bus.cmd(0x18);
++    bus.data(0x80);
++  }
++  const uint8_t softStart[] = {0xAE, 0xC7, 0xC3, 0xC0, 0x80};
++  const uint8_t gates[] = {0xDF, 0x01, 0x02};
++  bus.cmdData(0x0C, softStart, sizeof(softStart));
++  bus.cmdData(0x01, gates, sizeof(gates));
++  if (!gray) {
++    bus.cmd(0x3C);
++    bus.data(0x01);
++    bus.cmd(0x21);
++    bus.data(0x00);
++  }
++  bus.cmd(0x11);
++  bus.data(0x02);
++  const uint8_t xRange[] = {0x1F, 0x03, 0x00, 0x00};
++  const uint8_t yRange[] = {0x00, 0x00, 0xDF, 0x01};
++  bus.cmdData(0x44, xRange, sizeof(xRange));
++  bus.cmdData(0x45, yRange, sizeof(yRange));
++  resetRamCounter(bus);
++  if (gray) {
++    bus.cmd(0x3C);
++    bus.data(0x01);
++    bus.cmd(0x18);
++    bus.data(0x80);
++    bus.cmd(0x1A);
++    bus.data(0x5A);
+   }
+-  if (changedBits == 0) return false;
++  return true;
++}
+ 
+-  const unsigned long started = millis();
+-  uint8_t lut[111];
+-#if FREEINK_WAVEFORM_LAB
+-  const uint16_t firstFrames = labSelectPageLut(corrective, lut, &_labVolts);
+-#else
+-  const uint16_t firstFrames = makeTriLut(lut, corrective);
+-#endif
+-  uint16_t cleanFrames = 0;
+-  uint8_t stages = 1;
+-  uint32_t cleanedPixels = 0;
++void Ssd1683Driver::sleepVendor(EpdBus& bus) {
++  bus.cmd(0x10);
++  bus.data(0x01);
++  delay(100);
++  invalidateController();
++}
+ 
++bool Ssd1683Driver::runVendorGray(EpdBus& bus, const uint8_t* bwTarget) {
++  if (!initVendor(bus, true) || displayWorkCancelled()) return false;
++  for (uint32_t i = 0; i < BUFFER_SIZE; ++i) {
++    const uint8_t black = static_cast<uint8_t>(~bwTarget[i] & ~_grayMsb[i]);
++    _sel24[i] = static_cast<uint8_t>(black | (_grayMsb[i] & ~_grayLsb[i]));
++    _sel26[i] = static_cast<uint8_t>(black | _grayLsb[i]);
++  }
+   writePlane(bus, CMD_WRITE_NEW, _sel24);
+   writePlane(bus, CMD_WRITE_OLD, _sel26);
+-  loadCustomLut(bus, lut);
+-  activate(bus, _controllerPowered ? CTRL_DISPLAY_HOLD_WARM : CTRL_CUSTOM_HOLD_COLD);
+-  _controllerPowered = true;
+-
+-#if FREEINK_WAVEFORM_LAB
+-  // Lab stage 2 reuses the mandatory-second-activation structure the retired
+-  // post-clean validated (see the H experiment: once stage 1 has run, stage 2
+-  // must run too, or aborted input leaves the intermediate state on glass).
+-  // Same override precedence as labSelectPageLut(): a runtime set governs
+-  // completely, the baked set applies only while no runtime slot is active.
+-  const uint8_t* labStage2 = (_labActive & (1u << WAVELAB_SLOT_STAGE2)) ? _labLut[WAVELAB_SLOT_STAGE2] : nullptr;
+-#ifdef PAPER_MONO_WAVEFORM_BAKED_STAGE2
+-  if (_labActive == 0) labStage2 = PAPER_MONO_WAVEFORM_BAKED_STAGE2;
+-#endif
+-  if (labStage2) {
+-    memcpy(lut, labStage2, WAVELAB_LUT_BYTES);
+-    cleanFrames = ssd1683WaveLabLutFrames(lut);
+-    _labVolts = labStage2;
+-    loadCustomLut(bus, lut);
+-    activate(bus, CTRL_DISPLAY_HOLD_WARM);
+-    ++stages;
+-    cleanedPixels = static_cast<uint32_t>(WIDTH) * HEIGHT;
+-  } else
+-#endif
+-    // Retired in production (postCleanCycles is forced to 0): background deghost
+-    // now rides inside the tri activation's kick group, and the right-aligned
+-    // classes already end target-directed. Kept for lab experiments only.
+-    if (_tri.postCleanCycles > 0) {
+-#if FREEINK_WAVEFORM_LAB
+-      _labVolts = nullptr;
+-#endif
+-      cleanFrames = makePostCleanLut(lut);
+-      loadCustomLut(bus, lut);
+-      activate(bus, CTRL_DISPLAY_HOLD_WARM);
+-      ++stages;
+-      cleanedPixels = static_cast<uint32_t>(WIDTH) * HEIGHT;
+-    }
+-#if FREEINK_WAVEFORM_LAB
+-  _labVolts = nullptr;
+-#endif
++  if (displayWorkCancelled()) return false;
++  bus.cmd(0x22);
++  bus.data(0xD7);
++  bus.cmd(0x20);
++  if (!waitVendorReady(bus, true, 0xD7)) return false;
++  sleepVendor(bus);
++  _needsFull = true;
++  _needsBwRecovery = true;
++  return true;
++}
+ 
+-  // Commit the recorded glass state only after every required activation has
+-  // completed. Advancing it before the controller write made a failed update
+-  // look successful and poisoned every subsequent transition classification.
++bool Ssd1683Driver::runBwRecovery(EpdBus& bus, const uint8_t* bwTarget) {
++  if (!initVendor(bus, false) || displayWorkCancelled()) return false;
++  for (uint32_t i = 0; i < BUFFER_SIZE; ++i) _sel24[i] = static_cast<uint8_t>(~bwTarget[i]);
++  bus.cmd(0x22);
++  bus.data(0xF8);
++  writePlane(bus, CMD_WRITE_NEW, _sel24);
++  if (displayWorkCancelled()) return false;
++  bus.cmd(0x20);
++  if (!waitVendorReady(bus, true, 0xF8)) return false;
++  bus.cmd(0x22);
++  bus.data(0x14);
++  writePlane(bus, CMD_WRITE_OLD, bwTarget);
++  writePlane(bus, CMD_WRITE_NEW, bwTarget);
++  bus.cmd(0x20);
++  if (!waitVendorReady(bus, true, 0x14)) return false;
++  sleepVendor(bus);
+   for (uint32_t i = 0; i < BUFFER_SIZE; ++i) {
+-    const uint8_t bw = bwTarget[i];
+-    const uint8_t gray = useGray ? static_cast<uint8_t>(_grayLsb[i] | _grayMsb[i]) : 0u;
+-    _glassNonWhite[i] = static_cast<uint8_t>(gray | ~bw);
+-    _glassBlack[i] = static_cast<uint8_t>(~bw & ~gray);
++    _glassNonWhite[i] = static_cast<uint8_t>(~bwTarget[i]);
++    _glassBlack[i] = _glassNonWhite[i];
+   }
+-  _panelHasGray = useGray && (_grayLsbReady || _grayMsbReady);
+-
+-#ifdef ENABLE_SERIAL_LOG
+-  Serial.printf(
+-      "[%lu] SSD1677 update: stages=%u frames=%u+%u changed=%lu drive=%lu clean=%lu gray=%u full=%u "
+-      "elapsed=%lums\n",
+-      millis(), static_cast<unsigned>(stages), static_cast<unsigned>(firstFrames), static_cast<unsigned>(cleanFrames),
+-      static_cast<unsigned long>(changed), static_cast<unsigned long>(driven),
+-      static_cast<unsigned long>(cleanedPixels), static_cast<unsigned>(useGray), static_cast<unsigned>(corrective),
+-      millis() - started);
+-#else
+-  (void)firstFrames;
+-  (void)cleanFrames;
+-  (void)stages;
+-  (void)started;
+-#endif
+-  _displayCommitted = true;
++  _needsBwRecovery = false;
++  _needsFull = false;
+   return true;
+ }
+ 
++bool Ssd1683Driver::grayStagingReady() const {
++  return _grayLsbReady && _grayMsbReady && _grayLsbGeneration == _renderGeneration &&
++         _grayMsbGeneration == _renderGeneration;
++}
++
++void Ssd1683Driver::recordBwTarget(const uint8_t* bwTarget) {
++  memcpy(_lastBw, bwTarget, BUFFER_SIZE);
++  _lastBwValid = true;
++  _lastBwGeneration = _renderGeneration;
++}
++
+ void Ssd1683Driver::stashTarget(const uint8_t* fb, RefreshMode mode) {
+-  if (!allocateBuffers()) return;
++  if (!fb || !allocateBuffers()) return;
++  const uint8_t* owned = nullptr;
++  if (_pendingTri && _pendingGeneration == _renderGeneration)
++    owned = _pendingBw;
++  else if (_lastBwValid && _lastBwGeneration == _renderGeneration)
++    owned = _lastBw;
++  if (owned && memcmp(owned, fb, BUFFER_SIZE) != 0) clearGrayStaging();
+   memcpy(_pendingBw, fb, BUFFER_SIZE);
+   _pendingTri = true;
+-  _pendingCorrective = _needsFull || mode == RefreshMode::Full;
++  _pendingCorrective = mode == RefreshMode::Full;
+   _pendingGeneration = _renderGeneration;
+ }
+ 
+-bool Ssd1683Driver::commitPending(EpdBus& bus, bool useGray) {
+-  if (!_pendingTri) return false;
+-  if (_pendingGeneration != _renderGeneration) {
+-    _pendingTri = false;
+-    _pendingCorrective = false;
+-    clearGrayStaging();
+-    return false;
+-  }
++void Ssd1683Driver::commitPending(EpdBus& bus, bool useGray) {
++  if (!_pendingTri) return;
++  const bool eligible = _pendingGeneration == _renderGeneration && !displayWorkCancelled();
++  const bool corrective = _pendingCorrective || _needsFull;
+   _pendingTri = false;
+-  const bool corrective = _pendingCorrective;
+-  const bool ran = runUpdate(bus, _pendingBw, useGray, corrective);
+-  if (ran) _needsFull = false;
+   _pendingCorrective = false;
+-  if (_lastBw && (ran || !corrective)) {
+-    memcpy(_lastBw, _pendingBw, BUFFER_SIZE);
+-    _lastBwValid = true;
++  bool ran = false;
++  if (eligible) {
++    if (useGray && grayStagingReady())
++      ran = runVendorGray(bus, _pendingBw);
++    else if (_needsBwRecovery)
++      ran = runBwRecovery(bus, _pendingBw);
++    else if (!corrective && _lastBwValid && memcmp(_lastBw, _pendingBw, BUFFER_SIZE) == 0)
++      _lastBwGeneration = _renderGeneration;
++    else {
++      ran = runOtpUpdate(bus, _pendingBw, corrective);
++      if (ran) _needsFull = false;
++    }
++  }
++  if (ran) {
++    recordBwTarget(_pendingBw);
++    _displayCommitted = true;
+   }
+-  if (!useGray) _panelHasGray = false;
+   clearGrayStaging();
+-  return ran;
+ }
+ 
+ void Ssd1683Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
+   (void)prev;
+   (void)turnOff;
+   if (!fb) return;
+-  // Not initialised no longer implies an unknown glass state: controllerIdle()
+-  // parks the controller in deep sleep between pages. The paths that really do
+-  // invalidate the image -- begin(), deepSleep(), requestResync() -- raise
+-  // _needsFull themselves.
+-  if (!_initialized) {
+-    bus.reset();
+-    initController(bus);
+-  }
+-  if (!allocateBuffers()) return;
+-
+-  const bool corrective = _needsFull || mode == RefreshMode::Full;
+-  if (!corrective && _lastBwValid && !_panelHasGray && !_grayLsbReady && !_grayMsbReady &&
+-      memcmp(_lastBw, fb, BUFFER_SIZE) == 0) {
+-    // UI screens deliberately re-render an identical frame once their async
+-    // data lands. Submit no waveform, and leave any running deghost alone.
+-    return;
+-  }
+-
+   stashTarget(fb, mode);
+-  // displayGrayscaleBase() is the front half of a grayscale sequence: hold the
+-  // target so the gray planes can join it in a single activation.
+-  if (!_preparingGray) commitPending(bus, false);
++  commitPending(bus, false);
+ }
+ 
+ bool Ssd1683Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
+@@ -917,36 +764,28 @@ bool Ssd1683Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
+ }
+ 
+ void Ssd1683Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
+-  // displayStart() is synchronous. Balanced grayscale batching uses
+-  // displayGrayscaleBase()/displayGray() instead of the generic async split.
+   (void)bus;
+   (void)fb;
+ }
+ 
+ void Ssd1683Driver::seedPreviousFrame(EpdBus& bus, const uint8_t* buf) {
+-  if (!buf || !allocateBuffers()) return;
+-  // There is no host-managed previous-frame plane in this design: the selector
+-  // planes are rebuilt from _glass* on every activation. Record the caller's
+-  // baseline so the unchanged-frame test stays honest.
+   (void)bus;
++  if (!buf || !allocateBuffers()) return;
++  if (!_lastBwValid || memcmp(_lastBw, buf, BUFFER_SIZE) != 0) _lastBwGeneration = 0;
+   memcpy(_lastBw, buf, BUFFER_SIZE);
+   _lastBwValid = true;
+ }
+ 
+ void Ssd1683Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
+-  _preparingGray = true;
+-  display(bus, fb, nullptr, fallback, turnOff);
+-  _preparingGray = false;
++  (void)bus;
++  (void)turnOff;
++  stashTarget(fb, fallback);
+ }
+ 
+ void Ssd1683Driver::beginDisplayWork() {
+   _displayWorkGeneration = _abortGeneration.load();
+-  // Cleared per logical render so displayCommitted() answers "did this page
+-  // reach the panel", which is what a caller's refresh cadence must key off.
+   _displayCommitted = false;
+   if (++_renderGeneration == 0) ++_renderGeneration;
+-  // A logical render owns all three staged planes. Discard anything left by a
+-  // canceled/OOM render before allowing the next page to contribute strips.
+   _pendingTri = false;
+   _pendingCorrective = false;
+   clearGrayStaging();
+@@ -1011,96 +850,43 @@ void Ssd1683Driver::writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const
+   ready = markGrayRows(plane, yStart, numRows);
+ }
+ 
+-void Ssd1683Driver::prepareGrayscaleTarget(const uint8_t* bw) {
+-  // Both selector planes and the two-level target are staged in host RAM.
+-  // displayGray() validates complete, current-generation planes before use.
+-  (void)bw;
+-}
++void Ssd1683Driver::prepareGrayscaleTarget(const uint8_t* bw) { stashTarget(bw, RefreshMode::Fast); }
+ 
+ void Ssd1683Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
+                                 bool factoryMode) {
++  (void)fb;
+   (void)turnOff;
+   (void)lut;
+   (void)factoryMode;
+-  if (!allocateBuffers()) return;
+-
+-  if (displayWorkCancelled()) {
+-    // Input arrived while this page was being composed. Drop it whole: the
+-    // panel still shows the previous page, which is a valid state, and the
+-    // replacement page is already on its way. Nothing was submitted, so there
+-    // is no partial frame to repair.
+-    _pendingTri = false;
+-    _pendingCorrective = false;
+-    clearGrayStaging();
+-    return;
+-  }
+-
+-  const bool useGray = _grayLsbReady && _grayMsbReady && _grayLsbGeneration == _renderGeneration &&
+-                       _grayMsbGeneration == _renderGeneration;
+-  if (_pendingTri) {
+-    commitPending(bus, useGray);
+-    return;
+-  }
+-  // No two-level target is outstanding (a caller displayed one separately).
+-  // `fb` is not a reliable B/W target here: the full-frame text AA path reuses
+-  // the live framebuffer for its gray selector planes before calling us. Apply
+-  // those selectors to the preserved B/W page instead and do not poison the
+-  // baseline with selector bytes.
+-  if (!useGray || !_lastBwValid) {
+-    clearGrayStaging();
+-    return;
+-  }
+-  runUpdate(bus, _lastBw, true, false);
++  if (!_pendingTri && grayStagingReady() && _lastBwValid && _lastBwGeneration == _renderGeneration)
++    stashTarget(_lastBw, RefreshMode::Fast);
++  commitPending(bus, true);
+   clearGrayStaging();
+ }
+ 
+ void Ssd1683Driver::displayGrayCalibration(EpdBus& bus, const uint8_t* fb, uint16_t customX, uint16_t customY,
+                                            uint16_t customW, uint16_t customH) {
+-  // There is a single gray tone and a single waveform now, so a side-by-side
+-  // "reference vs current" split has nothing left to compare. Render the whole
+-  // frame through the production path instead, driving every pixel so the
+-  // result does not depend on what was on the panel before.
+   (void)customX;
+   (void)customY;
+   (void)customW;
+   (void)customH;
+-  if (!fb || !allocateBuffers()) return;
+-  memcpy(_pendingBw, fb, BUFFER_SIZE);
+-  _pendingTri = true;
+-  _pendingCorrective = true;
+-  _pendingGeneration = _renderGeneration;
+-  const bool useGray = _grayLsbReady && _grayMsbReady && _grayLsbGeneration == _renderGeneration &&
+-                       _grayMsbGeneration == _renderGeneration;
+-  commitPending(bus, useGray);
++  if (!fb) return;
++  stashTarget(fb, RefreshMode::Full);
++  commitPending(bus, true);
+ }
+ 
+ void Ssd1683Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
+-  if (!_pendingTri) {
+-    clearGrayStaging();
+-    return;
+-  }
+-  if (displayWorkCancelled()) {
+-    _pendingTri = false;
+-    _pendingCorrective = false;
+-    clearGrayStaging();
+-    return;
++  if (_pendingTri) {
++    if (bw) stashTarget(bw, _pendingCorrective ? RefreshMode::Full : RefreshMode::Fast);
++    commitPending(bus, true);
+   }
+-  // displayGray() bailed without consuming the stashed target (no selectors
+-  // were ever staged, for instance). The frame must still reach the panel.
+-  if (bw && _pendingBw) memcpy(_pendingBw, bw, BUFFER_SIZE);
+-  const bool useGray = _grayLsbReady && _grayMsbReady && _grayLsbGeneration == _renderGeneration &&
+-                       _grayMsbGeneration == _renderGeneration;
+-  commitPending(bus, useGray);
++  clearGrayStaging();
+ }
+ 
+ void Ssd1683Driver::controllerIdle(EpdBus& bus) {
+   if (!_initialized) return;
+   powerOffController(bus);
+ 
+-  // The controller loses its RAM and registers here, and that costs nothing:
+-  // both selector planes are rebuilt from the host-side glass model on every
+-  // activation, so waking is one reset pulse plus initController(), about 40 ms,
+-  // and only ever after the user has already stopped turning pages.
+   bus.cmd(0x10);
+   bus.data(0x03);  // SSD1677 deep-sleep key; 0x01 does not enter sleep.
+   delay(2);
+@@ -1112,27 +898,12 @@ void Ssd1683Driver::setGrayParams(const Ssd1683GrayParams& params) {
+   _grayParams = params;
+   if (_grayParams.lightFrames == 0) _grayParams.lightFrames = 1;
+   if (_grayParams.lightFrames > 12) _grayParams.lightFrames = 12;
+-  // Stored presets may still carry a nonzero polish count; the polish is
+-  // retired (see Ssd1683GrayParams), so it is not forwarded to the waveform.
+   _tri.postCleanCycles = 0;
+ 
+-  // lightFrames selects the middle tone: tGray weak-rail frames applied to a
+-  // saturated-white pixel. The full weak-rail swing is ~60 frames, so the
+-  // default 11 -> 24 frames lands near 40% -- a tone the eye separates from
+-  // both endpoints even on thin CJK strokes. Quantised to a multiple of three
+-  // so the gray class's white reset (kick + tGray/3) stays integral and the
+-  // class stays exactly DC balanced.
+   const uint16_t requested = static_cast<uint16_t>(2 * _grayParams.lightFrames + 2);
+   const uint16_t clamped = std::clamp<uint16_t>(requested, SAT_MIN_FRAMES / 2, 60);
+   _tri.tGray = static_cast<uint8_t>(((clamped + 1) / 3) * 3);
+ 
+-  // Buy exactly the white reset the gray class needs and no more. grayW is
+-  // kG + tGray/3 (makeTriLut()), and the reset only has to reach one full swing
+-  // -- past that it is overshoot the eye pays for, because every kick frame is
+-  // 10% of a swing toward black applied to the next page's glyph outlines. The
+-  // weak-rail develop already funds tGray/3 of it, so kG covers the shortfall:
+-  // at the default tGray=24 that is 2 frames instead of the whole 12-frame kick,
+-  // and a darker middle tone (larger tGray) funds the reset outright at kG=0.
+   const uint8_t fundedByGray = static_cast<uint8_t>(_tri.tGray / 3);
+   _tri.grayKick = fundedByGray >= GRAY_RESET_FRAMES ? 0 : static_cast<uint8_t>(GRAY_RESET_FRAMES - fundedByGray);
+ }
+@@ -1145,7 +916,6 @@ void Ssd1683Driver::requestResync(uint8_t settlePasses) {
+ }
+ 
+ void Ssd1683Driver::resetGray() {
+-  _panelHasGray = false;
+   clearGrayStaging();
+   _pendingTri = false;
+   _pendingCorrective = false;
+@@ -1164,10 +934,6 @@ void Ssd1683Driver::clearGrayStaging() {
+ }
+ 
+ void Ssd1683Driver::deepSleep(EpdBus& bus) {
+-  // controllerIdle() may already have parked the controller in the same deep
+-  // sleep mode. The register writes are then pointless, but the host-side state
+-  // reset below is not: this is the path after which EPD power is cut, so the
+-  // on-glass image can no longer be trusted.
+   if (_initialized) {
+     bus.waitBusy("SSD1683 idle");
+     powerOffController(bus);
+diff --git a/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.h b/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.h
+index 2b561e8..2317f7d 100644
+--- a/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.h
++++ b/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.h
+@@ -6,26 +6,8 @@
+ 
+ namespace freeink {
+ 
+-// Paper Mono panel driver. The controller is an SSD1677 (the file name is
+-// historical); every waveform it runs here is a host-authored 111-byte LUT.
+-//
+-// Binary UI and reader Fast paints use the panel's internal, temperature-
+-// selected, non-flashing OTP waveform. Balanced book paints are one target-
+-// coded W/G/B activation. On an ordinary page only changed pixels and target
+-// gray run a driven class; unchanged white *and* unchanged black hold on
+-// entry 0, which is idle. Holding unchanged black is what removes the "text
+-// vanishes then re-inks" whiteout: glyph pixels shared by two consecutive
+-// pages no longer transit through white just to be re-anchored. Residue is
+-// cleared by the packed erase wipe (see makeTriLut) and by the periodic
+-// corrective sweep, which re-drives every pixel.
+ struct Ssd1683GrayParams {
+-  // Retired endpoint-polish count, kept only so stored presets keep loading.
+-  // setGrayParams() ignores it: the driven classes are right-aligned and end
+-  // target-directed, and a 1+1 polish dither was measured to clean nothing.
+   uint8_t cleanupPasses = 0;
+-  // Legacy preset fields. Only lightFrames still has an effect: it selects the
+-  // full-resync middle tone (see setGrayParams). The rest are retained so
+-  // existing callers and stored presets keep compiling.
+   uint8_t revertBoost = 0;
+   uint8_t baseDouble = 0;
+   uint8_t grayStrong = 0;
+@@ -38,12 +20,6 @@ struct Ssd1683GrayParams {
+ };
+ 
+ #if FREEINK_WAVEFORM_LAB
+-// Waveform-lab override slots (serial waveform editor). All slots default
+-// inactive; with every slot inactive the driver's code paths, register writes
+-// and SPI traffic are identical to a build without the lab. Slot PAGE replaces
+-// the per-page tri LUT, STAGE2 appends a second activation after it, and
+-// CORRECTIVE replaces the LUT used by corrective (full) sweeps — falling back
+-// to PAGE, then to the built-in tri LUT, mirroring production structure.
+ inline constexpr uint8_t WAVELAB_SLOT_PAGE = 0;
+ inline constexpr uint8_t WAVELAB_SLOT_STAGE2 = 1;
+ inline constexpr uint8_t WAVELAB_SLOT_CORRECTIVE = 2;
+@@ -59,10 +35,6 @@ class Ssd1683Driver final : public PanelDriver {
+   void begin(EpdBus& bus) override;
+   void deepSleep(EpdBus& bus) override;
+   void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
+-  // The complete 3-gray target is intentionally batched in host RAM before a
+-  // waveform starts. Generic displayStart/displayFinish therefore stays
+-  // synchronous; advertising an in-flight refresh here would make BUSY polling
+-  // lie while no controller activation exists yet.
+   bool supportsAsyncDisplay() const override { return false; }
+   bool displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
+   void displayFinish(EpdBus& bus, const uint8_t* fb) override;
+@@ -72,8 +44,6 @@ class Ssd1683Driver final : public PanelDriver {
+   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
+   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
+   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
+-  // Selector staging is host-RAM only, so the renderer may hand over strips at
+-  // any time without synchronising against the controller.
+   bool supportsBusyGrayscaleStaging() const override { return true; }
+   void writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const uint8_t* rows, uint16_t yStart,
+                                 uint16_t numRows) override;
+@@ -84,8 +54,6 @@ class Ssd1683Driver final : public PanelDriver {
+   void cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) override;
+ 
+   void requestResync(uint8_t settlePasses) override;
+-  // Paper Mono cuts EPD power in deep sleep, so the on-glass state is unknown
+-  // at the first paint. Drive every pixel once instead of diffing.
+   void skipInitialResync() override { _needsFull = true; }
+   void beginDisplayWork() override;
+   void abortPostRefresh() override;
+@@ -98,23 +66,14 @@ class Ssd1683Driver final : public PanelDriver {
+   void resetGray();
+ 
+ #if FREEINK_WAVEFORM_LAB
+-  // Same locking model as setGrayParams(): written from the main task, read by
+-  // the render task. The editor serialises SET -> ack -> page turn, so a torn
+-  // 111-byte copy is not reachable in practice.
+   void waveLabSet(uint8_t slot, const uint8_t lut[WAVELAB_LUT_BYTES]);
+   void waveLabClear(uint8_t slot);
+   void waveLabOff() {
+     _labActive = 0;
+     _holdUnchangedBlack = true;
+   }
+-  // Overrides the production held-black behaviour (see runUpdate()). An
+-  // override LUT whose entry 0 is *not* idle will bleach held black, so such an
+-  // experiment must send HOLD 0 first. OFF restores the default.
+   void waveLabSetHold(bool hold) { _holdUnchangedBlack = hold; }
+   bool waveLabHold() const { return _holdUnchangedBlack; }
+-  // Fills `out` with the LUT the slot would run next (override when active,
+-  // otherwise the generated stock waveform plus the calibrated analog tail).
+-  // Returns true when the bytes come from an override.
+   bool waveLabGet(uint8_t slot, uint8_t out[WAVELAB_LUT_BYTES]) const;
+   uint8_t waveLabActiveMask() const { return _labActive; }
+ #endif
+@@ -122,30 +81,15 @@ class Ssd1683Driver final : public PanelDriver {
+  private:
+   // Timelines in 5 ms frames.
+   struct TriParams {
+-    // One-shot W/G/B sweep. The three per-class white lengths are derived from
+-    // these so that each class's net V*frames is exactly zero; see makeTriLut().
+     uint8_t preUp = 12;  // activation kick
+-    // The gray class's share of the kick, clamped to preUp. Derived by
+-    // setGrayParams() as the smallest value that still funds a full-swing white
+-    // reset; driving gray the whole kick is what made the next page's glyph
+-    // outlines flash black before developing. See makeTriLut().
+     uint8_t grayKick = 2;
+     uint8_t tGray = 24;           // weak-rail (+5 V) frames that develop the middle tone
+     uint8_t tBlack = 24;          // strong-rail (+15 V) frames that develop black
+     uint8_t postCleanCycles = 0;  // retired; nonzero only for lab experiments
+-    // Erase class re-packs one kick-length dose toward black before a
+-    // double-length wipe instead of idling out the middle of the tail. Same net
+-    // charge, twice the wipe dose; see makeTriLut().
+     bool packedErase = true;
+   };
+-  // Corrective sweeps re-drive every pixel, so nothing lands on entry 0 and the
+-  // held-black shortcut does not apply. They keep the original long profile --
+-  // a 16-frame kick and a 32-frame black develop, 64 frames total -- because a
+-  // full-swing reset is exactly what a corrective refresh is for.
+   static constexpr uint8_t CORRECTIVE_PRE_UP = 16;
+   static constexpr uint8_t CORRECTIVE_T_BLACK = 32;
+-  // Frames at -15 V for one full swing to saturated white; the target length of
+-  // the gray class's reset, and the budget setGrayParams() sizes grayKick to.
+   static constexpr uint8_t GRAY_RESET_FRAMES = 10;
+ 
+   bool allocateBuffers();
+@@ -159,12 +103,16 @@ class Ssd1683Driver final : public PanelDriver {
+   uint16_t makeTriLut(uint8_t out[111], bool corrective) const;
+   uint16_t makePostCleanLut(uint8_t out[111]) const;
+   bool runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forceAll);
+-  // Encodes the source-to-target transition against the recorded glass state,
+-  // runs its required activations plus optional endpoint post-clean, and waits
+-  // them out. Returns true when a waveform actually ran.
+-  bool runUpdate(EpdBus& bus, const uint8_t* bwTarget, bool useGray, bool corrective);
++  bool runVendorGray(EpdBus& bus, const uint8_t* bwTarget);
++  bool runBwRecovery(EpdBus& bus, const uint8_t* bwTarget);
++  bool initVendor(EpdBus& bus, bool gray);
++  bool waitVendorReady(EpdBus& bus, bool refresh, uint8_t control = 0);
++  void invalidateController();
++  void sleepVendor(EpdBus& bus);
++  bool grayStagingReady() const;
++  void recordBwTarget(const uint8_t* bwTarget);
+   void stashTarget(const uint8_t* fb, RefreshMode mode);
+-  bool commitPending(EpdBus& bus, bool useGray);
++  void commitPending(EpdBus& bus, bool useGray);
+   void clearGrayStaging();
+   bool markGrayRows(GrayPlane plane, uint16_t yStart, uint16_t numRows);
+   bool displayWorkCancelled() const;
+@@ -172,8 +120,7 @@ class Ssd1683Driver final : public PanelDriver {
+   bool _initialized = false;
+   bool _needsFull = true;
+   bool _lastBwValid = false;
+-  bool _preparingGray = false;
+-  bool _panelHasGray = false;
++  bool _needsBwRecovery = false;
+   bool _grayLsbReady = false;
+   bool _grayMsbReady = false;
+   bool _pendingTri = false;
+@@ -182,6 +129,7 @@ class Ssd1683Driver final : public PanelDriver {
+   bool _controllerPowered = false;
+   enum class LutState : uint8_t { Unknown, OtpBw, Custom };
+   LutState _lutState = LutState::Unknown;
++  uint32_t _lastBwGeneration = 0;
+   uint32_t _pendingGeneration = 0;
+   uint32_t _grayLsbGeneration = 0;
+   uint32_t _grayMsbGeneration = 0;
+@@ -190,24 +138,15 @@ class Ssd1683Driver final : public PanelDriver {
+   uint32_t _displayWorkGeneration = 0;
+   TriParams _tri{};
+   Ssd1683GrayParams _grayParams{};
+-  // Unchanged black holds on entry 0 instead of being re-driven through the
+-  // anti-target reset (see runUpdate()). Production default; only the waveform
+-  // lab turns it off, and only for an override whose entry 0 is not idle.
+   bool _holdUnchangedBlack = true;
+ 
+ #if FREEINK_WAVEFORM_LAB
+-  // Selects the active-slot LUT for this update, or generates the stock tri
+-  // LUT when no applicable override exists. Returns the frame count.
+   uint16_t labSelectPageLut(bool corrective, uint8_t out[WAVELAB_LUT_BYTES], const uint8_t** labVolts) const;
+   uint8_t _labActive = 0;  // bit per WAVELAB_SLOT_*
+   uint8_t _labLut[3][WAVELAB_LUT_BYTES]{};
+-  // Analog tail for the in-flight loadCustomLut(); nullptr = calibrated VOLT_*
+-  // constants, i.e. the stock write sequence.
+   const uint8_t* _labVolts = nullptr;
+ #endif
+ 
+-  // All logical raster order; writePlane() applies the 180-degree mount
+-  // transform on the way out.
+   uint8_t* _lastBw = nullptr;         // last committed two-level target
+   uint8_t* _pendingBw = nullptr;      // stashed target awaiting its activation
+   uint8_t* _grayLsb = nullptr;        // staged dark selector
+@@ -239,8 +178,6 @@ void ssd1683WaveLabSetHold(bool hold);
+ bool ssd1683WaveLabHold();
+ // True when a PaperMonoWaveformBaked.h export was compiled in as the default.
+ bool ssd1683WaveLabBakedPresent();
+-// Decodes total frame count (sum of TP*(RP+1) over the ten groups) from a raw
+-// 111-byte LUT; log/telemetry helper for host-authored waveforms.
+ uint16_t ssd1683WaveLabLutFrames(const uint8_t lut[WAVELAB_LUT_BYTES]);
+ #endif
+ 
