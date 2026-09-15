@@ -8,25 +8,6 @@
 
 #include <string>
 
-/*
-Define ENABLE_SERIAL_LOG to enable logging
-Can be set in platformio.ini build_flags or as a compile definition
-
-Define LOG_LEVEL to control log verbosity:
-0 = ERR only
-1 = ERR + INF
-2 = ERR + INF + DBG
-If not defined, defaults to 0
-
-If you have a legitimate need for raw Serial access (e.g., binary data,
-special formatting), use the underlying logSerial object directly:
-    logSerial.printf("Special case: %d\n", value);
-    logSerial.write(binaryData, length);
-
-The logSerial reference (defined below) points to the real Serial object and
-won't trigger deprecation warnings.
-*/
-
 #ifndef LOG_LEVEL
 #define LOG_LEVEL 0
 #endif
@@ -38,6 +19,22 @@ static HWCDC& logSerial = Serial;
 static HardwareSerial& logSerial = Serial;
 #define LOG_SERIAL_HAS_TX_TIMEOUT 0
 #endif
+
+class SerialTxLock {
+ public:
+  explicit SerialTxLock(uint32_t timeoutMs);
+  ~SerialTxLock();
+  explicit operator bool() const { return locked_; }
+  SerialTxLock(const SerialTxLock&) = delete;
+  SerialTxLock& operator=(const SerialTxLock&) = delete;
+
+ private:
+  bool locked_;
+};
+
+// Caller must hold SerialTxLock.
+size_t writeSerialTx(const uint8_t* data, size_t size, uint32_t timeoutMs);
+void flushSerialTx();
 
 void logPrintf(const char* level, const char* origin, const char* format, ...);
 
@@ -67,18 +64,12 @@ void logPrintf(const char* level, const char* origin, const char* format, ...);
 
 std::string getLastLogs();
 void clearLastLogs();
-// Validates the RTC log state (magic word + logHead range). Returns true if
-// corruption was detected (magic mismatch or logHead out of range), meaning
-// logMessages is untrusted garbage. Callers should call clearLastLogs() when
-// this returns true so getLastLogs() does not dump corrupt data into crash reports.
 bool sanitizeLogHead();
 
 class MySerialImpl : public Print {
  public:
   void begin(unsigned long baud) { logSerial.begin(baud); }
 
-  // Support boolean conversion for compatibility with code like:
-  //   if (Serial) or while (!Serial)
   operator bool() const { return logSerial; }
 
   __attribute__((deprecated("Use LOG_* macro instead"))) size_t printf(const char* format, ...);

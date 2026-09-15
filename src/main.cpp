@@ -14,13 +14,18 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <SPI.h>
+#include <UsbSerialTransport.h>
 #include <WiFi.h>
 #include <builtinFonts/all.h>
 
 #if FREEINK_DEVICE_PAPERMONO
 #include <M5Pm1.h>
+#include <PanelDiagnostic.h>
 #include <PaperMonoBoard.h>
 #include <SDCardManager.h>
+#include <UsbFileTransfer.h>
+#include <UsbPowerGuard.h>
+#include <UsbStorage.h>
 #include <Wire.h>
 #include <driver/Ssd1683Driver.h>
 #endif
@@ -92,9 +97,12 @@ FlashTtfFont builtinCjkFont;
 #endif
 static unsigned long allowSleepAt = 0;
 #if FREEINK_DEVICE_PAPERMONO
-// RAM-only test override. It is set through CMD:STAYAWAKE and intentionally
-// disappears on reset so normal saved power settings are never changed.
-static unsigned long debugSleepTimeoutMs = 0;
+static usb_transfer::SdStorage usbStorage;
+static usb_transfer::SerialTransport usbTransport;
+static usb_transfer::UsbFileTransfer usbTransfer(usbStorage, usbTransport);
+static UsbPowerGuard usbPowerGuard(externalPowerState);
+static std::unique_ptr<RenderLock> serialRenderLock;
+static bool diagnosticActive = false;
 #endif
 
 // Fonts
@@ -268,8 +276,111 @@ constexpr int sleepTestMode = -1;
 #endif
 #endif
 
+#if FREEINK_DEVICE_PAPERMONO
+static void releaseSerialSessionIfIdle() {
+  if (serialRenderLock && !usbTransfer.active() && !diagnosticActive) {
+    serialRenderLock.reset();
+    sdFontSystem.markRegistryDirty();
+    activityManager.noteUserInteraction();
+    activityManager.requestUpdate();
+  }
+}
+
+static bool acquireSerialSession() {
+  if (serialRenderLock) return true;
+  if (WiFi.getMode() != WIFI_MODE_NULL || activityManager.preventAutoSleep() || activityManager.skipLoopDelay()) {
+    return false;
+  }
+  serialRenderLock = std::make_unique<RenderLock>();
+  powerManager.setPowerSaving(false);
+  return true;
+}
+
+static void sendCaptureMetadata() {
+  const auto& meta = PanelDiagnostic::metadata();
+  char response[256];
+  snprintf(response, sizeof(response), "GRAYCAP META %u %u %u %u %u %08X %08X %u %u %u %u %u", meta.generation,
+           meta.driverGeneration, meta.width, meta.height, meta.planeBytes, meta.crc24, meta.crc26, meta.renderMs,
+           meta.busyMs, meta.activationCount, meta.control, meta.valid);
+  usbTransport.sendLine(response);
+}
+
+static void sendCaptureChunk(const char* command) {
+  unsigned generation = 0, ram = 0, offset = 0;
+  int consumed = 0;
+  if (sscanf(command, "CMD:GRAYCAP %u %x %u%n", &generation, &ram, &offset, &consumed) != 3 ||
+      command[consumed] != '\0' || (ram != 0x24 && ram != 0x26)) {
+    usbTransport.sendLine("GRAYCAP ERROR ARGUMENTS");
+    return;
+  }
+  uint8_t bytes[256];
+  const size_t count = PanelDiagnostic::readCapture(ram, generation, offset, bytes, sizeof(bytes));
+  if (!count) {
+    usbTransport.sendLine("GRAYCAP ERROR RANGE");
+    return;
+  }
+  char header[80];
+  snprintf(header, sizeof(header), "GRAYCAP DATA %u %02X %u %u ", generation, ram, offset,
+           static_cast<unsigned>(count));
+  std::string response(header);
+  response.reserve(response.size() + count * 2);
+  static constexpr char hex[] = "0123456789abcdef";
+  for (size_t i = 0; i < count; ++i) {
+    response += hex[bytes[i] >> 4];
+    response += hex[bytes[i] & 15];
+  }
+  usbTransport.sendLine(response);
+}
+
+static bool dispatchUsbCommand(const std::string& line) {
+  const bool protocol = line == "CP1" || line.compare(0, 4, "CP1 ") == 0;
+  const bool diagnostic = line.compare(0, 12, "CMD:GRAYTEST") == 0 || line.compare(0, 11, "CMD:GRAYCAP") == 0;
+  if (line == "CMD:SLEEP") return false;
+  if ((usbTransfer.active() && !protocol) || (diagnosticActive && !diagnostic)) {
+    usbTransport.sendLine("CP1 ERROR BUSY");
+    return true;
+  }
+  if (!protocol && !diagnostic) return false;
+  if (!acquireSerialSession()) {
+    RenderLock renderLock;
+    usbTransport.sendLine("CP1 ERROR BUSY");
+    return true;
+  }
+  if (protocol) {
+    usbTransfer.pollLine(line);
+  } else if (line == "CMD:GRAYTEST END") {
+    PanelDiagnostic::releaseCapture();
+    diagnosticActive = false;
+    usbTransport.sendLine("GRAYTEST END");
+  } else if (line == "CMD:GRAYTEST") {
+    diagnosticActive = PanelDiagnostic::renderFixture();
+    if (diagnosticActive)
+      sendCaptureMetadata();
+    else
+      usbTransport.sendLine("GRAYTEST ERROR CAPTURE");
+  } else if (line == "CMD:GRAYCAP") {
+    sendCaptureMetadata();
+  } else if (line.compare(0, 12, "CMD:GRAYCAP ") == 0) {
+    sendCaptureChunk(line.c_str());
+  } else {
+    usbTransport.sendLine("GRAYCAP ERROR COMMAND");
+  }
+  releaseSerialSessionIfIdle();
+  return true;
+}
+#endif
+
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout = false) {
+#if FREEINK_DEVICE_PAPERMONO
+  if (!usbTransfer.abort()) {
+    LOG_ERR("USB", "Transfer cleanup failed; sleep cancelled");
+    return;
+  }
+  PanelDiagnostic::releaseCapture();
+  diagnosticActive = false;
+  serialRenderLock.reset();
+#endif
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
@@ -495,13 +606,12 @@ void setup() {
 
   t1 = millis();
 
-#ifdef ENABLE_SERIAL_LOG
-  // Earliest possible Serial setup. The 250 ms stall before begin() lets the
-  // USB Serial/JTAG peripheral finish power-on and lets the host complete USB
-  // enumeration before we touch the CDC state — otherwise cold boot races
-  // and the host has to be physically replugged for logs to flow. Warm reboot
-  // worked without the delay because USB was already enumerated.
+#if defined(ENABLE_SERIAL_LOG) || FREEINK_DEVICE_PAPERMONO
+  // USB enumeration must settle before CDC initialization.
   delay(250);
+#if FREEINK_DEVICE_PAPERMONO
+  logSerial.setRxBufferSize(2048);
+#endif
   Serial.begin(115200);
 #if LOG_SERIAL_HAS_TX_TIMEOUT
   logSerial.setTxTimeoutMs(1);  // This is a load-bearing 1. Do not modify.
@@ -813,24 +923,53 @@ void loop() {
     lastMemPrint = millis();
   }
 
-  // Handle incoming serial commands,
-  // nb: we use logSerial from logging to avoid deprecation warnings
-  if (logSerial.available() > 0) {
-    String line = logSerial.readStringUntil('\n');
+#if FREEINK_DEVICE_PAPERMONO
+  usbTransfer.tick(millis());
+  static unsigned long disconnectedSince = 0;
+  if (usbTransfer.active() && !logSerial) {
+    if (!disconnectedSince) disconnectedSince = millis();
+    if (millis() - disconnectedSince >= 1000) usbTransfer.abort();
+  } else {
+    disconnectedSince = 0;
+  }
+  releaseSerialSessionIfIdle();
+#endif
+  static usb_transfer::SerialLineBuffer serialLine;
+  for (size_t received = 0; received < 256 && logSerial.available() > 0; ++received) {
+    const int byte = logSerial.read();
+    if (byte < 0) break;
+    const auto result = serialLine.push(static_cast<uint8_t>(byte));
+    if (result == usb_transfer::SerialLineBuffer::Result::Pending) continue;
+    if (result == usb_transfer::SerialLineBuffer::Result::Malformed) {
+#if FREEINK_DEVICE_PAPERMONO
+      if (acquireSerialSession()) {
+        usbTransfer.abort();
+        usbTransport.sendLine("CP1 ERROR LINE");
+        releaseSerialSessionIfIdle();
+      }
+#endif
+      break;
+    }
+#if FREEINK_DEVICE_PAPERMONO
+    if (dispatchUsbCommand(serialLine.line())) break;
+#endif
+    String line(serialLine.line());
     if (line.startsWith("CMD:")) {
       String cmd = line.substring(4);
       cmd.trim();
       if (cmd == "SCREENSHOT") {
-        const uint32_t bufferSize = display.getBufferSize();
-        logSerial.printf("SCREENSHOT_START:%d\n", bufferSize);
-        uint8_t* buf = display.getFrameBuffer();
-        // Chunked: the CDC TX timeout is 1 ms (see setTxTimeoutMs below), so a
-        // single 64 KB write drops everything past the first endpoint FIFO fill.
-        for (uint32_t sent = 0; sent < bufferSize; sent += 64) {
-          logSerial.write(buf + sent, std::min<uint32_t>(64, bufferSize - sent));
-          logSerial.flush();
+        RenderLock renderLock;
+        SerialTxLock txLock(1000);
+        if (txLock) {
+          const uint32_t bufferSize = display.getBufferSize();
+          char header[48];
+          const int length = snprintf(header, sizeof(header), "\nSCREENSHOT_START:%u\n", bufferSize);
+          if (writeSerialTx(reinterpret_cast<const uint8_t*>(header), length, 1000) == static_cast<size_t>(length) &&
+              writeSerialTx(display.getFrameBuffer(), bufferSize, 5000) == bufferSize) {
+            constexpr char end[] = "SCREENSHOT_END\n";
+            writeSerialTx(reinterpret_cast<const uint8_t*>(end), sizeof(end) - 1, 1000);
+          }
         }
-        logSerial.printf("SCREENSHOT_END\n");
       } else if (cmd.startsWith("TAP ")) {
         int x = -1;
         int y = -1;
@@ -858,25 +997,14 @@ void loop() {
         LOG_INF("INPUT", "Injected SETTINGS navigation");
 #endif
 #if FREEINK_DEVICE_PAPERMONO
-      } else if (cmd == "STAYAWAKE") {
-        debugSleepTimeoutMs = 2UL * 60UL * 60UL * 1000UL;
-        activityManager.noteUserInteraction();
-        LOG_INF("SLP", "RAM-only auto-sleep timeout override: %lu ms", debugSleepTimeoutMs);
       } else if (cmd == "WAKESRC") {
-        // The PMIC latches why it powered the board on, and begin() reads and
-        // clears it. USB CDC is not up yet when that happens, so the boot log
-        // line is unreliable over serial -- report the retained copy instead.
         const uint8_t src = PaperMonoBoard::wakeSource();
         LOG_INF("SLP", "Latched wake source=0x%02X (btn=%d extGpio=%d) motion=%d", src,
                 (src & freeink::m5pm1::WAKE_PWR_BUTTON) ? 1 : 0, (src & freeink::m5pm1::WAKE_EXT_GPIO) ? 1 : 0,
                 PaperMonoBoard::wokeByMotion() ? 1 : 0);
       } else if (cmd == "SLEEP") {
-        // Sleep on demand. The raise-to-wake failure mode only shows itself
-        // across a real shutdown, and waiting out the auto-sleep timeout makes
-        // that a multi-minute loop per attempt. Reports the PMIC's own wake
-        // reason on the way back up (see the "Paper Mono PMIC: wake=" line).
         LOG_INF("SLP", "Sleep requested over serial");
-        logSerial.flush();
+        Serial.flush();
         enterDeepSleep();
 #if FREEINK_SLEEP_LAB
       } else if (cmd.startsWith("SLEEPX")) {
@@ -893,7 +1021,7 @@ void loop() {
         }
         LOG_INF("SLP", "Sleep requested over serial, arming mode %d (auto power-on in %u s)", sleepTestMode,
                 static_cast<unsigned>(kSleepTestReturnSeconds));
-        logSerial.flush();
+        Serial.flush();
         enterDeepSleep();
         sleepTestMode = -1;
       } else if (cmd == "LIFTSLEEP") {
@@ -906,7 +1034,7 @@ void loop() {
         // gesture never fired.
         sleepTestMode = 2;  // force motion wake armed, IMU left alive
         LOG_INF("SLP", "LIFTSLEEP: shutting down with the lift gesture armed and no timer");
-        logSerial.flush();
+        Serial.flush();
         enterDeepSleep();
         sleepTestMode = -1;
       } else if (cmd == "PMICDUMP") {
@@ -1201,19 +1329,40 @@ void loop() {
         }
 #endif
       } else if (cmd == "BATTERY") {
+        RenderLock renderLock;
         const BatteryMonitor::Status status = BatteryMonitor().readStatus();
-        logSerial.printf(
+        SerialTxLock txLock(1000);
+        char response[256];
+        const int responseLength = snprintf(
+            response, sizeof(response),
             "BATTERY supported=%d percent=%d:%u mv=%d:%u ext=%d:%d charging=%d:%d vin=%ld usb=%ld src=%d\n",
             status.supported, status.percentageKnown, status.percentage, status.millivoltsKnown, status.millivolts,
             status.externalPowerKnown, status.externalPowerKnown ? status.externalPower : false, status.chargingKnown,
             status.chargingKnown ? status.charging : false, static_cast<long>(status.pm1VinMv),
             static_cast<long>(status.pm1VinOutMv), status.pm1PowerSource);
+        if (txLock && responseLength > 0 && static_cast<size_t>(responseLength) < sizeof(response)) {
+          writeSerialTx(reinterpret_cast<const uint8_t*>(response), responseLength, 1000);
+        }
       }
     }
+    break;
   }
 
   // Check for any user activity (button press or release) or active background work
   static unsigned long lastActivityTime = millis();
+  static unsigned long lastPowerDisconnect = 0;
+#if FREEINK_DEVICE_PAPERMONO
+  const unsigned long powerNow = millis();
+  const bool stayAwake = usbPowerGuard.shouldStayAwake(powerNow, usbTransfer.active());
+  if (usbPowerGuard.consumeUnplugEvent()) {
+    lastActivityTime = powerNow;
+    lastPowerDisconnect = powerNow;
+    usbTransfer.abort();
+    releaseSerialSessionIfIdle();
+  }
+#else
+  constexpr bool stayAwake = false;
+#endif
   if (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity() || halTiltSensor.hadActivity() ||
       activityManager.preventAutoSleep()) {
     lastActivityTime = millis();         // Reset inactivity timer
@@ -1228,6 +1377,14 @@ void loop() {
   // reaches this path and remains reserved for PMIC download mode.
   if (millis() >= allowSleepAt && gpio.wasPressed(HalGPIO::BTN_POWER)) {
     enterDeepSleep();
+    return;
+  }
+#endif
+#if FREEINK_DEVICE_PAPERMONO
+  if (serialRenderLock) {
+    lastActivityTime = millis();
+    activityManager.finishUserInteractionDispatch();
+    delay(1);
     return;
   }
 #endif
@@ -1253,12 +1410,8 @@ void loop() {
     screenshotComboActive = false;
   }
 
-  const unsigned long sleepTimeoutMs =
-#if FREEINK_DEVICE_PAPERMONO
-      debugSleepTimeoutMs != 0 ? debugSleepTimeoutMs :
-#endif
-                               SETTINGS.getSleepTimeoutMs();
-  if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
+  const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
+  if (!stayAwake && sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
     LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
     enterDeepSleep(true);
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
@@ -1268,7 +1421,8 @@ void loop() {
   // Face-down auto-sleep: the IMU watch (HalTiltSensor) times how long the
   // device has been lying screen-down; past the configured delay, sleep now.
   const uint32_t faceDownSleepMs = SETTINGS.getFaceDownSleepMs();
-  if (faceDownSleepMs > 0 && millis() >= allowSleepAt && halTiltSensor.faceDownForMs() >= faceDownSleepMs) {
+  if (!stayAwake && faceDownSleepMs > 0 && millis() >= allowSleepAt &&
+      millis() - lastPowerDisconnect >= faceDownSleepMs && halTiltSensor.faceDownForMs() >= faceDownSleepMs) {
     LOG_INF("SLP", "Face-down for %lu ms; sleeping", static_cast<unsigned long>(faceDownSleepMs));
     enterDeepSleep(true);
     return;
