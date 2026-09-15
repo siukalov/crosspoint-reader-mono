@@ -39,6 +39,9 @@ enable_testing()
 include(GoogleTest)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME mapped_input
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/mapped_input_test.py
+)
 add_test(NAME panel_diagnostic
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/panel_diagnostic_test.py
 )
@@ -58,7 +61,7 @@ add_test(NAME usb_file_transfer
 add_test(NAME usb_serial_transport
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/usb_serial_transport/run.sh
 )
-set_tests_properties(panel_diagnostic panel_transition usb_file_transfer usb_serial_transport PROPERTIES
+set_tests_properties(mapped_input panel_diagnostic panel_transition usb_file_transfer usb_serial_transport PROPERTIES
   ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
 )
 

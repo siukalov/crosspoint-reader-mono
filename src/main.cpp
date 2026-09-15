@@ -919,7 +919,7 @@ void loop() {
   static unsigned long lastMemPrint = 0;
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
-  gpio.update();
+  mappedInputManager.update();
 #if FREEINK_DEVICE_PAPERMONO
   // Input is sampled on the main task while display work runs on the render
   // task. Signal it at the raw edge so four-gray refinement/background cleanup
