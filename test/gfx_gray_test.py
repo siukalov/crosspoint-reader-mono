@@ -75,11 +75,23 @@ class EInkDisplay {
 #pragma once
 #include <Arduino.h>
 #include <string>
+#include <vector>
 class HalFile {
  public:
-  bool seekSet(size_t) { std::abort(); }
-  int read(void*, size_t) { std::abort(); }
-  bool close() { std::abort(); }
+  std::vector<uint8_t> bytes;
+  size_t position = 0;
+  HalFile() = default;
+  explicit HalFile(std::vector<uint8_t> data) : bytes(std::move(data)) {}
+  explicit operator bool() const { return !bytes.empty(); }
+  bool seek(size_t offset) { if (offset > bytes.size()) return false; position = offset; return true; }
+  bool seekSet(size_t offset) { return seek(offset); }
+  bool seekCur(size_t offset) { return seek(position + offset); }
+  int read() { return position < bytes.size() ? bytes[position++] : -1; }
+  int read(void* target, size_t size) {
+    size = std::min(size, bytes.size() - position);
+    std::memcpy(target, bytes.data() + position, size); position += size; return size;
+  }
+  bool close() { return true; }
 };
 struct HostStorage {
   bool openFileForRead(const char*, const std::string&, HalFile&) { std::abort(); }
@@ -124,6 +136,11 @@ uint16_t HalDisplay::getDisplayHeight() const { return 480; }
 uint16_t HalDisplay::getDisplayWidthBytes() const { return 100; }
 uint32_t HalDisplay::getBufferSize() const { return 48000; }
 void HalDisplay::clearScreen(uint8_t color) const { physical.fill(color); }
+void HalDisplay::drawImage(const uint8_t* data, uint16_t x, uint16_t y, uint16_t width, uint16_t height, bool) const {
+  for (unsigned row = 0; row < height && y + row < 480; ++row)
+    for (unsigned byte = 0; byte < width / 8 && x / 8 + byte < 100; ++byte)
+      physical[(y + row) * 100 + x / 8 + byte] = data[row * (width / 8) + byte];
+}
 void HalDisplay::displayBuffer(RefreshMode, bool) { ++submissions; }
 void HalDisplay::displayBufferAsync(RefreshMode) { ++submissions; ++asyncSubmissions; }
 void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool fading) {
@@ -801,6 +818,261 @@ static void testGlyphCoverage(HalDisplay& hal) {
   testGlyphScan(renderer);
 }
 
+
+static constexpr GfxRenderer::Orientation writerOrientations[] = {
+  GfxRenderer::Portrait, GfxRenderer::LandscapeClockwise,
+  GfxRenderer::PortraitInverted, GfxRenderer::LandscapeCounterClockwise
+};
+
+static void testOpaqueFills(GfxRenderer& renderer) {
+  std::array<uint8_t, 48000> b{}, l{}, m{}, expectedB{}, expectedSelectors{};
+  GrayFrame tuple{{b.data(), b.size()}, {l.data(), l.size()}, {m.data(), m.size()}, 800, 480, 100};
+  const int rectangles[][4] = {{477, 1, 1, 22}, {777, 477, 22, 1}, {2, 777, 1, 22}, {1, 2, 22, 1}};
+  const uint8_t patterns[][4] = {{0xFF, 0xFF, 0xAA, 0x55}, {0xAA, 0x55, 0xAA, 0x55}};
+  bool coherent = true;
+  auto live = physical;
+  for (unsigned orientation = 0; orientation < 4; ++orientation) {
+    renderer.setOrientation(writerOrientations[orientation]);
+    GfxRenderer::ScopedTarget target(renderer, tuple, coherent);
+    const int* rect = rectangles[orientation];
+    for (unsigned ink = 0; ink < 4; ++ink) {
+      tuple.fill(2); expectedB.fill(0); expectedSelectors.fill(0xFF);
+      const uint8_t pattern = ink == 0 ? 0xFF : ink == 1 ? 0 : patterns[ink - 2][orientation];
+      if (ink < 2) renderer.fillRect(rect[0], rect[1], rect[2], rect[3], ink == 1);
+      else renderer.fillRectDither(rect[0], rect[1], rect[2], rect[3], ink == 2 ? LightGray : DarkGray);
+      expectedB[200] = pattern & 0x7F; expectedB[201] = pattern; expectedB[202] = pattern & 0xFE;
+      expectedSelectors[200] = 0x80; expectedSelectors[201] = 0; expectedSelectors[202] = 0x01;
+      expect(b.data(), expectedB.data(), b.size(), "opaque oriented fill B");
+      expect(l.data(), expectedSelectors.data(), l.size(), "opaque oriented fill L");
+      expect(m.data(), expectedSelectors.data(), m.size(), "opaque oriented fill M");
+    }
+  }
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  {
+    GfxRenderer::ScopedTarget target(renderer, tuple, coherent);
+    tuple.fill(0);
+    for (int x = 0; x < 8; ++x) renderer.drawCoverage(x, 0, x % 4);
+    renderer.fillRect(1, 0, 2, 1, false);
+    const uint8_t eb = 0xEC, el = 0x02, em = 0x06;
+    expect(b.data(), &eb, 1, "opaque single-byte fill B");
+    expect(l.data(), &el, 1, "opaque single-byte fill L");
+    expect(m.data(), &em, 1, "opaque single-byte fill M");
+    tuple.fill(0);
+    for (int x = 0; x < 8; ++x) renderer.drawCoverage(x, 0, x % 4);
+    renderer.invertScreen();
+    const uint8_t ib = 0x33, il = 0x44, im = 0x66;
+    expect(b.data(), &ib, 1, "renderer inversion B");
+    expect(l.data(), &il, 1, "renderer inversion L");
+    expect(m.data(), &im, 1, "renderer inversion M");
+    renderer.invertScreen();
+    require(b[0] == 0xCC && l[0] == 0x22 && m[0] == 0x66, "renderer double inversion");
+    renderer.drawPixel(2, 0, false);
+    require(b[0] == 0xEC && l[0] == 0x02 && m[0] == 0x46, "opaque pixel clears selectors");
+  }
+  expect(physical.data(), live.data(), live.size(), "opaque offscreen preserves HAL");
+}
+
+static void testOpaqueImages(GfxRenderer& renderer) {
+  std::array<uint8_t, 48000> b{}, l{}, m{}, expectedB{}, expectedSelectors{};
+  GrayFrame tuple{{b.data(), b.size()}, {l.data(), l.size()}, {m.data(), m.size()}, 800, 480, 100};
+  const int origins[][2] = {{473, 9}, {773, 473}, {4, 773}, {9, 4}};
+  const int clips[][4] = {{474, 10, 2, 11}, {779, 474, 11, 2}, {4, 779, 2, 11}, {10, 4, 11, 2}};
+  const uint8_t image[] = {0xA5, 0x5A, 0xFF, 0x00};
+  bool coherent = true;
+  auto live = physical;
+  for (unsigned i = 0; i < 4; ++i) {
+    renderer.setOrientation(writerOrientations[i]);
+    GfxRenderer::ScopedTarget target(renderer, tuple, coherent);
+    tuple.fill(2); expectedB.fill(0); expectedSelectors.fill(0xFF);
+    renderer.drawImage(image, origins[i][0], origins[i][1], 17, 2);
+    expectedB[401] = 0xA5; expectedB[402] = 0x5A; expectedB[501] = 0xFF;
+    expectedSelectors[401] = expectedSelectors[402] = expectedSelectors[501] = expectedSelectors[502] = 0;
+    expect(b.data(), expectedB.data(), b.size(), "offscreen image B");
+    expect(l.data(), expectedSelectors.data(), l.size(), "offscreen image L");
+    expect(m.data(), expectedSelectors.data(), m.size(), "offscreen image M");
+    expect(physical.data(), live.data(), live.size(), "offscreen image preserves HAL");
+    tuple.fill(2); expectedB.fill(0); expectedSelectors.fill(0xFF);
+    const int* clip = clips[i];
+    renderer.setGrayscaleClipRect(clip[0], clip[1], clip[2], clip[3]);
+    renderer.drawImage(image, origins[i][0], origins[i][1], 17, 2);
+    expectedB[401] = 0x25; expectedB[402] = 0x58; expectedB[501] = 0x3F;
+    expectedSelectors[401] = expectedSelectors[501] = 0xC0;
+    expectedSelectors[402] = expectedSelectors[502] = 0x07;
+    expect(b.data(), expectedB.data(), b.size(), "clipped image B");
+    expect(l.data(), expectedSelectors.data(), l.size(), "clipped image L");
+    expect(m.data(), expectedSelectors.data(), m.size(), "clipped image M");
+  }
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+}
+
+static void testImageBand(GfxRenderer& renderer) {
+  std::array<uint8_t, 100> band{};
+  auto live = physical;
+  const uint8_t image[] = {0, 0x5A, 0xFF};
+  GfxRenderer::ScopedTarget target(renderer, band.data(), 4, 1);
+  renderer.drawImage(image, 8, 3, 8, 3);
+  std::array<uint8_t, 100> expected{}; expected[1] = 0x5A;
+  expect(band.data(), expected.data(), band.size(), "image clipped to band origin");
+  expect(physical.data(), live.data(), live.size(), "band image preserves HAL");
+}
+
+static HalFile bitmapFile(bool binary) {
+  const uint32_t paletteBytes = binary ? 8 : 16;
+  std::vector<uint8_t> bytes(54 + paletteBytes + 4);
+  auto put = [&](size_t offset, uint32_t value, unsigned count) {
+    for (unsigned i = 0; i < count; ++i) bytes[offset + i] = value >> (8 * i);
+  };
+  put(0, 0x4D42, 2); put(2, bytes.size(), 4); put(10, 54 + paletteBytes, 4);
+  put(14, 40, 4); put(18, 4, 4); put(22, uint32_t(-1), 4);
+  put(26, 1, 2); put(28, binary ? 1 : 2, 2);
+  for (unsigned i = 0; i < (binary ? 2u : 4u); ++i)
+    for (unsigned channel = 0; channel < 3; ++channel) bytes[54 + i * 4 + channel] = i * (binary ? 255 : 85);
+  bytes[54 + paletteBytes] = binary ? 0xA0 : 0xD8;
+  return HalFile(std::move(bytes));
+}
+
+static void testTransparentWriters(GfxRenderer& renderer) {
+  std::array<uint8_t, 48000> b{}, l{}, m{};
+  GrayFrame tuple{{b.data(), b.size()}, {l.data(), l.size()}, {m.data(), m.size()}, 800, 480, 100};
+  bool coherent = true;
+  {
+    GfxRenderer::ScopedTarget target(renderer, tuple, coherent);
+    tuple.fill(3);
+    renderer.drawCoverage(0, 0, 1, false);
+    DirectPixelWriter direct; direct.init(renderer); direct.beginRow(0);
+    const uint8_t samples[] = {3, 1, 2, 0};
+    for (int x = 0; x < 4; ++x) direct.writePixel(x, samples[x]);
+    require(b[0] == 0x20 && l[0] == 0xC0 && m[0] == 0xE0, "direct white skips and shades replace black");
+    tuple.fill(3); renderer.drawCoverage(0, 0, 1, false);
+    auto file = bitmapFile(false); Bitmap bitmap(file);
+    require(bitmap.parseHeaders() == BmpReaderError::Ok, "real gray bitmap fixture parses");
+    renderer.drawBitmap(bitmap, 0, 0, 0, 0);
+    require(b[0] == 0x20 && l[0] == 0xC0 && m[0] == 0xE0, "bitmap white skips and shades replace black");
+    tuple.fill(2);
+    auto monoFile = bitmapFile(true); Bitmap mono(monoFile);
+    require(mono.parseHeaders() == BmpReaderError::Ok, "real mono bitmap fixture parses");
+    renderer.drawBitmap1Bit(mono, 0, 0, 0, 0);
+    require(b[0] == 0 && l[0] == 0xAF && m[0] == 0xAF, "mono bitmap white preserves gray");
+    tuple.fill(2);
+    const uint8_t icon[] = {0x7F, 0xFF};
+    renderer.drawIcon(icon, 0, 0, 2);
+    require(b[0] == 0 && l[0] == 0xBF && m[0] == 0xBF, "icon transparent white preserves gray");
+  }
+  std::array<uint8_t, 100> ls{}, ms{};
+  {
+    GfxRenderer::ScopedTarget target(renderer, ls.data(), 0, 1, ms.data());
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_BOTH);
+    auto file = bitmapFile(false); Bitmap bitmap(file);
+    require(bitmap.parseHeaders() == BmpReaderError::Ok, "dual bitmap parses");
+    renderer.drawBitmap(bitmap, 0, 0, 0, 0);
+    require(ls[0] == 0x40 && ms[0] == 0x60, "bitmap dual-plane selectors");
+  }
+}
+
+
+static void testImageSampleOrientations(GfxRenderer& renderer) {
+  std::array<uint8_t, 48000> b{}, l{}, m{}, eb{}, el{}, em{};
+  GrayFrame tuple{{b.data(), b.size()}, {l.data(), l.size()}, {m.data(), m.size()}, 800, 480, 100};
+  const int offsets[][4] = {{47900, 47800, 47700, 47600}, {47999, 47999, 47999, 47999},
+                           {99, 199, 299, 399}, {0, 0, 0, 0}};
+  const uint8_t masks[][4] = {{0x80, 0x80, 0x80, 0x80}, {1, 2, 4, 8}, {1, 1, 1, 1}, {0x80, 0x40, 0x20, 0x10}};
+  const uint8_t samples[] = {3, 1, 2, 0};
+  bool coherent = true;
+  for (unsigned i = 0; i < 4; ++i) {
+    renderer.setOrientation(writerOrientations[i]);
+    GfxRenderer::ScopedTarget target(renderer, tuple, coherent);
+    for (bool bitmapSource : {false, true}) {
+      tuple.fill(2); eb.fill(0); el.fill(0xFF); em.fill(0xFF);
+      if (bitmapSource) {
+        auto file = bitmapFile(false); Bitmap bitmap(file);
+        require(bitmap.parseHeaders() == BmpReaderError::Ok, "oriented bitmap parses");
+        renderer.drawBitmap(bitmap, 0, 0, 0, 0);
+      } else {
+        DirectPixelWriter direct; direct.init(renderer); direct.beginRow(0);
+        for (int x = 0; x < 4; ++x) direct.writePixel(x, samples[x]);
+      }
+      eb[offsets[i][2]] |= masks[i][2];
+      el[offsets[i][2]] &= ~masks[i][2];
+      el[offsets[i][3]] &= ~masks[i][3]; em[offsets[i][3]] &= ~masks[i][3];
+      expect(b.data(), eb.data(), b.size(), "oriented image sample B");
+      expect(l.data(), el.data(), l.size(), "oriented image sample L");
+      expect(m.data(), em.data(), m.size(), "oriented image sample M");
+    }
+  }
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+}
+
+static void testWriterOwnerControls(GfxRenderer& renderer) {
+  std::array<uint8_t, 100> strip{}, secondary{};
+  for (auto mode : {GfxRenderer::BW, GfxRenderer::BW_GRAY_BASE, GfxRenderer::GRAYSCALE_LSB,
+                    GfxRenderer::GRAYSCALE_MSB, GfxRenderer::GRAYSCALE_BOTH}) {
+    GfxRenderer::ScopedTarget target(renderer, strip.data(), 0, 1, secondary.data());
+    renderer.setRenderMode(mode);
+    renderer.clearScreen(mode < GfxRenderer::GRAYSCALE_LSB ? 0xFF : 0);
+    auto file = bitmapFile(false); Bitmap bitmap(file);
+    require(bitmap.parseHeaders() == BmpReaderError::Ok, "legacy bitmap parses");
+    renderer.drawBitmap(bitmap, 0, 0, 0, 0);
+    const uint8_t expected[] = {0x8F, 0xAF, 0x40, 0x60, 0x40};
+    require(strip[0] == expected[mode], "AA-off bitmap legacy modes");
+  }
+  require(renderer.setUiGrayEnabled(true), "opaque live enable"); renderer.clearScreen();
+  renderer.drawCoverage(1, 0, 2);
+  renderer.fillRect(1, 0, 1, 1, false);
+  require(physical[0] == 0xFF && renderer.getLiveGrayPlane(true)[0] == 0 &&
+          renderer.getLiveGrayPlane(false)[0] == 0, "live opaque fill clears selectors");
+  renderer.drawCoverage(1, 0, 2);
+  const uint8_t* liveL = renderer.getLiveGrayPlane(true);
+  const uint8_t* liveM = renderer.getLiveGrayPlane(false);
+  for (auto owner : {GfxRenderer::FrameOwner::ReaderBase, GfxRenderer::FrameOwner::ReaderScratch}) {
+    GfxRenderer::ScopedTarget scratch(renderer, owner);
+    renderer.clearScreen(0);
+    renderer.fillRect(0, 0, 24, 1, false);
+    const uint8_t image[] = {0x5A}; renderer.drawImage(image, 0, 0, 8, 1);
+    DirectPixelWriter direct; direct.init(renderer); direct.beginRow(0); direct.writePixel(1, 0);
+    renderer.invertScreen();
+    require(liveL[0] == 0x40 && liveM[0] == 0x40, "reader opaque writes preserve live selectors");
+  }
+  renderer.clearScreen();
+}
+
+static void testCachedWriter(GfxRenderer& renderer) {
+  std::array<uint8_t, 100> a, b;
+  a.fill(0xFF); b.fill(0xFF);
+  auto live = physical;
+  DirectPixelWriter direct;
+  direct.init(renderer); direct.beginRow(0);
+  {
+    GfxRenderer::ScopedTarget first(renderer, a.data(), 0, 1);
+    direct.beginRow(0);
+    direct.writePixel(0, 0);
+    expect(physical.data(), live.data(), live.size(), "stale direct writer preserves live");
+    direct.init(renderer); direct.beginRow(0); direct.writePixel(0, 0);
+    require(a[0] == 0x7F, "direct reinit writes current target");
+    {
+      GfxRenderer::ScopedTarget second(renderer, b.data(), 0, 1);
+      direct.writePixel(1, 0);
+      require(a[0] == 0x7F && b[0] == 0xFF, "stale direct writer within row rejects replacement");
+    }
+    direct.writePixel(2, 0);
+    require(a[0] == 0x7F, "stale direct writer rejects restored target");
+    direct.init(renderer); direct.beginRow(0); direct.writePixel(1, 0);
+    require(a[0] == 0x3F, "direct reinit after restore");
+  }
+}
+
+static void testOpaqueWriters(HalDisplay& hal) {
+  GfxRenderer renderer(hal); renderer.begin(); renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  renderer.clearScreen();
+  testOpaqueFills(renderer);
+  testOpaqueImages(renderer);
+  testImageBand(renderer);
+  testTransparentWriters(renderer);
+  testImageSampleOrientations(renderer);
+  testCachedWriter(renderer);
+  testWriterOwnerControls(renderer);
+}
+
 int main() {
   HalDisplay hal;
   {
@@ -875,7 +1147,8 @@ int main() {
   testUiSubmission(renderer);
   testReaderImport(renderer);
   testGlyphCoverage(hal);
-  std::puts("PASS: actual renderer ownership, submission, imports, glyph coverage, font decoding, rotation and scan controls");
+  testOpaqueWriters(hal);
+  std::puts("PASS: actual renderer ownership, submission, imports, glyphs, opaque writers, image clipping and stale target controls");
   }
   require(liveAllocations == 0, "renderer destruction releases pair");
 }
@@ -1055,6 +1328,8 @@ int main() {
 """
 
 CPP_SOURCES = [
+    "lib/GfxRenderer/Bitmap.cpp",
+    "lib/GfxRenderer/BitmapHelpers.cpp",
     "lib/EpdFont/EpdFont.cpp",
     "lib/EpdFont/EpdFontFamily.cpp",
     "lib/EpdFont/FontDecompressor.cpp",
@@ -1123,6 +1398,10 @@ class RendererSeamTest(unittest.TestCase):
             dead_strip = "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections"
             subprocess.run([*cxx, dead_strip, *objects, "-o", str(binary)], check=True)
 
+            if os.environ.get("GFX_GRAY_BASELINE_ONLY"):
+                subprocess.run([str(binary)], check=True)
+                return
+
             source = RENDERER.read_text()
             mutated = work / "GfxRenderer-mutant.cpp"
             mutant_object = work / "renderer-mutant.o"
@@ -1148,6 +1427,13 @@ class RendererSeamTest(unittest.TestCase):
                 ("glyph scan writes", "  if (renderer.isFontCacheScanning()) return true;", "",
                  "glyph scan preserves B: byte 1702 expected FF, actual F7"),
             ]
+            mutants += [
+                ("opaque masked fill", "tuple.clearSelectors(phyX0, phyX1 + 1, py);", "(void)py;",
+                 "opaque oriented fill L: byte 200 expected 80, actual FF"),
+                ("offscreen image bypass", "  drawPhysicalImage(bitmap, rotatedX, rotatedY, width, height);",
+                 "  display.drawImage(bitmap, rotatedX, rotatedY, width, height);",
+                 "offscreen image B: byte 401 expected A5, actual 00"),
+            ]
             for name, original, replacement, expected_error in mutants:
                 pattern = r"\s+".join(re.escape(part) for part in original.split())
                 matches = list(re.finditer(pattern, source))
@@ -1158,6 +1444,27 @@ class RendererSeamTest(unittest.TestCase):
                 subprocess.run([*cxx, dead_strip, str(mutant_object), *objects[1:], "-o", str(mutant_binary)], check=True)
                 result = subprocess.run([str(mutant_binary)], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, f"{name} mutant survived")
+                self.assertIn(expected_error, result.stderr)
+                print("EXPECTED MUTANT FAILURE:", result.stderr.strip())
+            direct_source = (ROOT / "lib/Epub/Epub/converters/DirectPixelWriter.h").read_text()
+            original = "    if (!renderer->isTargetCurrent(generation)) return;"
+            self.assertEqual(direct_source.count(original), 1, "stale direct writer mutant anchor changed")
+            direct_mutants = [
+                (direct_source.replace(original, ""),
+                 "stale direct writer preserves live: byte 0 expected FF, actual 7F"),
+                (direct_source.replace(original, "").replace("  inline void beginRow(int logicalY) {",
+                 "  inline void beginRow(int logicalY) {\n    if (!renderer->isTargetCurrent(generation)) { logicalRowVisible = false; return; }"),
+                 "stale direct writer within row rejects replacement: expected true, actual false"),
+            ]
+            for mutated_header, expected_error in direct_mutants:
+                (work / "DirectPixelWriter.h").write_text(mutated_header)
+                stale_object = work / "stale-direct.o"
+                subprocess.run([*cxx, "-std=c++17", *common, "-c", str(harness), "-o", str(stale_object)], check=True)
+                stale_objects = objects.copy()
+                stale_objects[1 + len(CPP_SOURCES)] = str(stale_object)
+                subprocess.run([*cxx, dead_strip, *stale_objects, "-o", str(mutant_binary)], check=True)
+                result = subprocess.run([str(mutant_binary)], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, "stale direct writer mutant survived")
                 self.assertIn(expected_error, result.stderr)
                 print("EXPECTED MUTANT FAILURE:", result.stderr.strip())
             self.assertEqual(RENDERER.read_text(), source, "production source changed during test")

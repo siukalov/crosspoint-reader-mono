@@ -104,6 +104,9 @@ class GfxRenderer {
   bool submitUiGray(HalDisplay::RefreshMode refreshMode) const;
 
   GrayFrame activeTuple() const;
+  bool drawShade(int x, int y, uint8_t darkness) const;
+  void drawBitmapPixel(int x, int y, uint8_t value) const;
+  void drawPhysicalImage(const uint8_t* bitmap, uint16_t x, uint16_t y, uint16_t width, uint16_t height) const;
   bool accountCancellation() const;
   bool canSubmit() const;
   void invalidateTarget() const;
@@ -247,6 +250,7 @@ class GfxRenderer {
 
   bool glyphIntersectsStrip(int x0, int y0, int x1, int y1) const;
 
+  GrayFrame getWriteTuple() const { return activeTuple(); }
   uint8_t* getWriteTarget() const { return frameBuffer ? (target_.strip ? target_.buffer : frameBuffer) : nullptr; }
   uint8_t* getSecondaryWriteTarget() const { return frameBuffer && target_.strip ? target_.secondary : nullptr; }
   int getWriteOriginY() const { return target_.strip ? target_.y0 : 0; }

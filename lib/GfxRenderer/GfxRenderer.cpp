@@ -667,6 +667,7 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
 
 void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
   if (!getWriteTarget()) return;
+  if (drawShade(x, y, state ? 3 : 0)) return;
   if (target_.clip && renderMode >= GRAYSCALE_LSB &&
       (x < target_.x0 || x >= target_.x1 || y < target_.clipY0 || y >= target_.y1)) {
     return;
@@ -1076,7 +1077,8 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
   int ly0 = std::max(0, y);
   int lx1 = std::min(screenW, x + width);
   int ly1 = std::min(screenH, y + height);
-  if (target_.clip && renderMode >= GRAYSCALE_LSB) {
+  const GrayFrame tuple = activeTuple();
+  if (target_.clip && (tuple.valid() || renderMode >= GRAYSCALE_LSB)) {
     lx0 = std::max(lx0, target_.x0);
     ly0 = std::max(ly0, target_.clipY0);
     lx1 = std::min(lx1, target_.x1);
@@ -1099,6 +1101,10 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
   phyY0 = std::max(phyY0, originY);
   phyY1 = std::min(phyY1, originY + writeRows - 1);
   if (phyY0 > phyY1) return;
+
+  if (tuple.valid()) {
+    for (int py = phyY0; py <= phyY1; ++py) tuple.clearSelectors(phyX0, phyX1 + 1, py);
+  }
 
   const int byteStart = phyX0 >> 3;
   const int byteEnd = phyX1 >> 3;  // inclusive
@@ -1360,7 +1366,7 @@ void GfxRenderer::fillRoundedRect(const int x, const int y, const int width, con
 }
 
 void GfxRenderer::drawImage(const uint8_t bitmap[], const int x, const int y, const int width, const int height) const {
-  if (!frameBuffer || target_.strip) return;
+  if (!getWriteTarget() || !bitmap || width <= 0 || height <= 0) return;
   int rotatedX = 0;
   int rotatedY = 0;
   rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY, panelWidth, panelHeight);
@@ -1378,7 +1384,58 @@ void GfxRenderer::drawImage(const uint8_t bitmap[], const int x, const int y, co
     case LandscapeCounterClockwise:
       break;
   }
-  display.drawImage(bitmap, rotatedX, rotatedY, width, height);
+  drawPhysicalImage(bitmap, rotatedX, rotatedY, width, height);
+}
+
+void GfxRenderer::drawPhysicalImage(const uint8_t* bitmap, uint16_t x, uint16_t y, uint16_t width,
+                                    uint16_t height) const {
+  const int sourceByteX = x / 8;
+  const int sourceStride = width / 8;
+  uint8_t* target = getWriteTarget();
+  const int originY = getWriteOriginY();
+  int x0 = sourceByteX * 8;
+  int x1 = std::min<int>(panelWidth, x0 + sourceStride * 8);
+  int y0 = std::max<int>(y, originY);
+  int y1 = std::min<int>(y + height, originY + getWriteRows());
+  if (target_.clip) {
+    int ax, ay, bx, by;
+    rotateCoordinates(orientation, target_.x0, target_.clipY0, &ax, &ay, panelWidth, panelHeight);
+    rotateCoordinates(orientation, target_.x1 - 1, target_.y1 - 1, &bx, &by, panelWidth, panelHeight);
+    x0 = std::max(x0, std::min(ax, bx));
+    x1 = std::min(x1, std::max(ax, bx) + 1);
+    y0 = std::max(y0, std::min(ay, by));
+    y1 = std::min(y1, std::max(ay, by) + 1);
+  }
+  if (x0 >= x1 || y0 >= y1) return;
+  const GrayFrame tuple = activeTuple();
+  const bool hasTuple = tuple.valid();
+  for (int row = y0; row < y1; ++row) {
+    uint8_t* destination = target + (row - originY) * panelWidthBytes;
+    GrayFrame::copyPlaneRow(destination, bitmap + (row - y) * sourceStride, x0, x1, 0, sourceByteX);
+    if (hasTuple) tuple.clearSelectors(x0, x1, row);
+  }
+}
+
+bool GfxRenderer::drawShade(const int x, const int y, const uint8_t darkness) const {
+  const GrayFrame tuple = activeTuple();
+  if (!tuple.valid()) return false;
+  if (target_.clip && (x < target_.x0 || x >= target_.x1 || y < target_.clipY0 || y >= target_.y1)) return true;
+  int px, py;
+  rotateCoordinates(orientation, x, y, &px, &py, panelWidth, panelHeight);
+  tuple.writeShade(px, py, darkness);
+  return true;
+}
+
+void GfxRenderer::drawBitmapPixel(const int x, const int y, const uint8_t value) const {
+  if (value >= 3 || drawShade(x, y, 3 - value)) return;
+  if (renderMode == GRAYSCALE_BOTH) {
+    drawGrayPixel(x, y, value == 1, value > 0);
+    return;
+  }
+  constexpr uint8_t paintedValues[] = {0x07, 0x03, 0x02, 0x06};
+  if (renderMode >= BW && renderMode <= GRAYSCALE_MSB && (paintedValues[renderMode] & (1 << value))) {
+    drawPixel(x, y, renderMode < GRAYSCALE_LSB);
+  }
 }
 
 void GfxRenderer::drawIcon(const uint8_t bitmap[], const int x, const int y, const int size) const {
@@ -1482,13 +1539,7 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
 
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
 
-      if ((renderMode == BW && val < 3) || (renderMode == BW_GRAY_BASE && val < 2)) {
-        drawPixel(screenX, screenY);
-      } else if (renderMode == GRAYSCALE_MSB && (val == 1 || val == 2)) {
-        drawPixel(screenX, screenY, false);
-      } else if (renderMode == GRAYSCALE_LSB && val == 1) {
-        drawPixel(screenX, screenY, false);
-      }
+      drawBitmapPixel(screenX, screenY, val);
     }
   }
 

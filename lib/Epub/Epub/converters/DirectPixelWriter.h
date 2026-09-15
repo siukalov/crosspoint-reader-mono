@@ -6,47 +6,39 @@
 
 #include <cassert>
 
-// Direct framebuffer writer that eliminates per-pixel overhead from the image
-// rendering hot path.  Pre-computes orientation transform as linear coefficients
-// and caches render-mode state so the inner loop is: one multiply, one add,
-// one shift, and one AND per pixel — no branches, no method calls.
-//
-// Caller is responsible for ensuring (outX, outY) are within screen bounds.
-// ImageBlock::render() already validates this before entering the pixel loop,
-// and the JPEG/PNG callbacks pre-clamp destination ranges to screen bounds.
 struct DirectPixelWriter {
+  const GfxRenderer* renderer = nullptr;
+  uint32_t generation = 0;
+  GrayFrame tuple;
+  bool hasTuple;
   uint8_t* fb;
   uint8_t* fbSecondary;
   GfxRenderer::RenderMode mode;
   uint16_t displayWidthBytes;  // Runtime framebuffer stride (X4: 100, X3: 99)
-  // Active write target: for tiled grayscale, fb is the band scratch, originY is
-  // the band's top physical row, and clipRows is the band height. Off-band
-  // pixels are dropped. With no strip active these collapse to the full frame
-  // (originY 0, clipRows panelHeight) so the clip doubles as a bounds guard.
   int originY;
   int clipRows;
   bool logicalClipEnabled;
   bool logicalRowVisible;
   int logicalClipX0, logicalClipY0, logicalClipX1, logicalClipY1;
 
-  // Orientation is collapsed into a linear transform:
-  //   phyX = phyXBase + x * phyXStepX + y * phyXStepY
-  //   phyY = phyYBase + x * phyYStepX + y * phyYStepY
   int phyXBase, phyYBase;
   int phyXStepX, phyYStepX;  // per logical-X step
   int phyXStepY, phyYStepY;  // per logical-Y step
 
-  // Row-precomputed: the Y-dependent portion of the physical coords
   int rowPhyXBase, rowPhyYBase;
 
   void init(GfxRenderer& renderer) {
+    this->renderer = &renderer;
+    generation = renderer.getTargetGeneration();
+    tuple = renderer.getWriteTuple();
+    hasTuple = tuple.valid();
     fb = renderer.getWriteTarget();
     fbSecondary = renderer.getSecondaryWriteTarget();
     originY = renderer.getWriteOriginY();
     clipRows = renderer.getWriteRows();
     mode = renderer.getRenderMode();
     displayWidthBytes = renderer.getDisplayWidthBytes();
-    logicalClipEnabled = renderer.grayscaleClipEnabled() && mode >= GfxRenderer::GRAYSCALE_LSB;
+    logicalClipEnabled = renderer.grayscaleClipEnabled() && (hasTuple || mode >= GfxRenderer::GRAYSCALE_LSB);
     logicalRowVisible = true;
     logicalClipX0 = renderer.grayscaleClipX0();
     logicalClipY0 = renderer.grayscaleClipY0();
@@ -58,7 +50,6 @@ struct DirectPixelWriter {
 
     switch (renderer.getOrientation()) {
       case GfxRenderer::Portrait:
-        // phyX = y, phyY = (phyH-1) - x
         phyXBase = 0;
         phyYBase = phyH - 1;
         phyXStepX = 0;
@@ -67,7 +58,6 @@ struct DirectPixelWriter {
         phyYStepY = 0;
         break;
       case GfxRenderer::LandscapeClockwise:
-        // phyX = (phyW-1) - x, phyY = (phyH-1) - y
         phyXBase = phyW - 1;
         phyYBase = phyH - 1;
         phyXStepX = -1;
@@ -76,7 +66,6 @@ struct DirectPixelWriter {
         phyYStepY = -1;
         break;
       case GfxRenderer::PortraitInverted:
-        // phyX = (phyW-1) - y, phyY = x
         phyXBase = phyW - 1;
         phyYBase = 0;
         phyXStepX = 0;
@@ -85,7 +74,6 @@ struct DirectPixelWriter {
         phyYStepY = 0;
         break;
       case GfxRenderer::LandscapeCounterClockwise:
-        // phyX = x, phyY = y
         phyXBase = 0;
         phyYBase = 0;
         phyXStepX = 1;
@@ -94,7 +82,6 @@ struct DirectPixelWriter {
         phyYStepY = 1;
         break;
       default:
-        // Fallback to LandscapeCounterClockwise (identity transform)
         phyXBase = 0;
         phyYBase = 0;
         phyXStepX = 1;
@@ -105,25 +92,13 @@ struct DirectPixelWriter {
     }
   }
 
-  // Call once per row before the column loop.
-  // Pre-computes the Y-dependent portion so writePixel() only needs the X part.
   inline void beginRow(int logicalY) {
     rowPhyXBase = phyXBase + logicalY * phyXStepY;
     rowPhyYBase = phyYBase + logicalY * phyYStepY;
-    logicalRowVisible = !logicalClipEnabled ||
-                        (logicalY >= logicalClipY0 && logicalY < logicalClipY1);
+    logicalRowVisible = !logicalClipEnabled || (logicalY >= logicalClipY0 && logicalY < logicalClipY1);
   }
 
-  // For the current row (set via beginRow), narrow [colStart, colEnd) to the
-  // columns whose pixels fall inside the active strip band. writePixel() would
-  // clip the rest anyway, but on a strip pass that is most of a full-page image
-  // (only ~one strip-height worth of columns survive in portrait); skipping them
-  // here avoids the per-pixel unpack+transform entirely. For full-frame passes
-  // (clipRows == panel height) the range is unchanged. xBase is the logical X of
-  // column 0; the band test mirrors writePixel(): 0 <= phyY - originY < clipRows.
   inline void bandColRange(int xBase, int width, int& colStart, int& colEnd) const {
-    // init() only ever sets phyYStepX to 0, +1, or -1; the +1/-1 solve below
-    // relies on that.
     assert(phyYStepX == 0 || phyYStepX == 1 || phyYStepX == -1);
     colStart = 0;
     colEnd = width;
@@ -144,13 +119,10 @@ struct DirectPixelWriter {
       }
     }
     if (phyYStepX == 0) {
-      // phyY is constant across the row: the whole row is in-band or out.
       const int sy = rowPhyYBase - originY;
       if (static_cast<unsigned>(sy) >= static_cast<unsigned>(clipRows)) colEnd = 0;
       return;
     }
-    // phyY = rowPhyYBase + logicalX * phyYStepX (phyYStepX is +1 or -1).
-    // Solve originY <= phyY <= originY + clipRows - 1 for logicalX.
     const int loY = originY;
     const int hiY = originY + clipRows - 1;
     int xLo, xHi;
@@ -170,16 +142,18 @@ struct DirectPixelWriter {
     if (colStart > colEnd) colStart = colEnd;
   }
 
-  // Write a single 2-bit dithered pixel value to the framebuffer.
-  // Must be called after beginRow() for the current row.
-  // No bounds checking — caller guarantees coordinates are valid.
   inline void writePixel(int logicalX, uint8_t pixelValue) const {
-    if (!logicalRowVisible ||
-        (logicalClipEnabled && (logicalX < logicalClipX0 || logicalX >= logicalClipX1))) {
+    if (!renderer->isTargetCurrent(generation)) return;
+    if (!logicalRowVisible || (logicalClipEnabled && (logicalX < logicalClipX0 || logicalX >= logicalClipX1))) {
+      return;
+    }
+    if (hasTuple) {
+      if (pixelValue < 3) {
+        tuple.writeShade(rowPhyXBase + logicalX * phyXStepX, rowPhyYBase + logicalX * phyYStepX, 3 - pixelValue);
+      }
       return;
     }
     const bool dual = mode == GfxRenderer::GRAYSCALE_BOTH;
-    // Determine whether to draw based on render mode
     bool draw;
     bool state;
     switch (mode) {
@@ -212,8 +186,6 @@ struct DirectPixelWriter {
     const int phyX = rowPhyXBase + logicalX * phyXStepX;
     const int phyY = rowPhyYBase + logicalX * phyYStepX;
 
-    // Band-local row. The unsigned compare drops both off-band pixels (strip
-    // mode) and any out-of-frame row (full-frame mode) in one branch.
     const int sy = phyY - originY;
     if (static_cast<unsigned>(sy) >= static_cast<unsigned>(clipRows)) return;
 
@@ -235,15 +207,6 @@ struct DirectPixelWriter {
   }
 };
 
-// Direct cache writer that eliminates per-pixel overhead from PixelCache::setPixel().
-// Pre-computes row pointer so the inner loop is just byte index + bit manipulation.
-//
-// The cache buffer is a small streaming band (e.g. 16 rows), not the full image,
-// so a band-relative row/column that lands outside it would corrupt adjacent
-// heap. This writer therefore bounds-checks every access: beginRow() invalidates
-// the row when it falls outside the band, and writePixel() drops out-of-range
-// columns. This path only runs during the single decode that populates the
-// cache, never on the screen render hot path, so the checks are cheap.
 struct DirectCacheWriter {
   uint8_t* buffer;
   int bytesPerRow;
@@ -259,7 +222,6 @@ struct DirectCacheWriter {
     rowPtr = nullptr;
   }
 
-  // Call once per row before the column loop. Drops rows outside the band.
   inline void beginRow(int screenY, int cacheOriginY) {
     const int localRow = screenY - cacheOriginY;
     rowPtr = (static_cast<unsigned>(localRow) < static_cast<unsigned>(bandRows))
@@ -267,8 +229,6 @@ struct DirectCacheWriter {
                  : nullptr;
   }
 
-  // Write a 2-bit pixel value. Drops the write if the row is out of band or the
-  // column is out of range.
   inline void writePixel(int screenX, uint8_t value) const {
     if (!rowPtr) return;
     const int localX = screenX - originX;

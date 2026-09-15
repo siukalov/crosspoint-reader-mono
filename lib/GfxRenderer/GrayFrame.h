@@ -72,13 +72,33 @@ class GrayFrame {
     return true;
   }
 
-  static void copyPlaneRow(uint8_t* destination, const uint8_t* source, size_t x0, size_t x1, uint8_t fill = 0) {
-    for (size_t byteX = x0 / 8; byteX < (x1 + 7) / 8; ++byteX) {
-      const size_t first = byteX * 8 < x0 ? x0 - byteX * 8 : 0;
-      const size_t last = byteX * 8 + 8 > x1 ? x1 - byteX * 8 : 8;
-      const uint8_t mask = (0xFF >> first) & (0xFF << (8 - last));
-      replace(destination[byteX], mask, source ? source[byteX] : fill);
+  static void copyPlaneRow(uint8_t* destination, const uint8_t* source, size_t x0, size_t x1, uint8_t fill = 0,
+                           size_t sourceByteX = 0) {
+    if (x0 >= x1) return;
+    const size_t first = x0 / 8;
+    const size_t last = (x1 - 1) / 8;
+    const uint8_t head = 0xFF >> (x0 % 8);
+    const uint8_t tail = 0xFF << (7 - ((x1 - 1) % 8));
+    if (first == last) {
+      replace(destination[first], head & tail, source ? source[first - sourceByteX] : fill);
+      return;
     }
+    replace(destination[first], head, source ? source[first - sourceByteX] : fill);
+    if (last > first + 1) {
+      if (source)
+        std::memcpy(destination + first + 1, source + first + 1 - sourceByteX, last - first - 1);
+      else
+        std::memset(destination + first + 1, fill, last - first - 1);
+    }
+    replace(destination[last], tail, source ? source[last - sourceByteX] : fill);
+  }
+
+  bool clearSelectors(size_t x0, size_t x1, size_t y) const {
+    if (x0 >= x1 || x1 > width_ || !containsByte(x0 / 8, y)) return false;
+    const size_t row = (y - y0_) * stride_;
+    copyPlaneRow(l_.data + row, nullptr, x0, x1);
+    copyPlaneRow(m_.data + row, nullptr, x0, x1);
+    return true;
   }
 
   bool fill(uint8_t darkness) const {
