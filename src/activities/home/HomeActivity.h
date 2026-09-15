@@ -17,16 +17,11 @@ class HomeActivity final : public Activity {
   bool firstRenderDone = false;
   bool postEnterRefreshDone = false;
   bool hasOpdsServers = false;
-  bool coverRendered = false;      // Track if cover has been rendered once
-  bool coverBufferStored = false;  // Track if cover buffer is stored
-  // Home can be entered while Back is still held (e.g. leaving Settings with
-  // Back): ignore that stale release until a fresh press is seen here.
+  bool coverRendered = false;
+  bool coverBufferStored = false;
   bool backPressSeen = false;
-  uint8_t* coverBuffer = nullptr;  // HomeActivity's own buffer for cover image
-  size_t coverBufferSize = 0;      // Bytes allocated to coverBuffer
-  // Logical rect last passed to drawRecentBookCover. The cover snapshot only
-  // needs to cover this region, not the entire framebuffer, so we cache the
-  // tile instead of all 48 KB. Set in render() before the call.
+  uint8_t* coverBuffer = nullptr;
+  GfxRenderer::FrameSnapshot coverSnapshot;
   int coverRectX = 0;
   int coverRectY = 0;
   int coverRectW = 0;
@@ -35,7 +30,6 @@ class HomeActivity final : public Activity {
   const HomeMenuItem initialMenuItem;
   const bool refreshAfterEnter;
 
-  // Convert HomeMenuItem to menu index (used in onEnter)
   static int menuItemToIndex(HomeMenuItem item, bool hasOpdsUrl) {
     int i = 0;
     if (item == HomeMenuItem::FILE_BROWSER) return i;
@@ -50,7 +44,6 @@ class HomeActivity final : public Activity {
     return 0;
   }
 
-  // Convert menu index to HomeMenuItem (used in loop)
   static HomeMenuItem indexToMenuItem(int idx, bool hasOpdsUrl) {
     int i = 0;
     if (idx == i++) return HomeMenuItem::FILE_BROWSER;
@@ -68,16 +61,15 @@ class HomeActivity final : public Activity {
   void onOpdsBrowserOpen();
 
   int getMenuItemCount() const;
-  bool storeCoverBuffer();    // Store frame buffer for cover image
-  bool restoreCoverBuffer();  // Restore frame buffer from stored cover
-  void freeCoverBuffer();     // Free the stored cover buffer
+  bool storeCoverBuffer();
+  bool restoreCoverBuffer();
+  void freeCoverBuffer();
   void loadRecentBooks(int maxBooks);
   void loadRecentCovers(int coverHeight);
 
  public:
   explicit HomeActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                        HomeMenuItem initialMenuItemValue = HomeMenuItem::NONE,
-                        bool refreshAfterEnterValue = false)
+                        HomeMenuItem initialMenuItemValue = HomeMenuItem::NONE, bool refreshAfterEnterValue = false)
       : Activity("Home", renderer, mappedInput),
         initialMenuItem(initialMenuItemValue),
         refreshAfterEnter(refreshAfterEnterValue) {}

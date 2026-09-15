@@ -18,16 +18,13 @@ namespace {
 
 constexpr unsigned long POPUP_DURATION_MS = 1500;
 
-// A token is selectable when it has an ASCII alphanumeric or a non-ASCII
-// codepoint outside U+2000-U+206F (dashes, bullets and other General
-// Punctuation that appear as standalone tokens are not words).
 bool isSelectableToken(const char* text) {
   for (const uint8_t* p = reinterpret_cast<const uint8_t*>(text); *p != 0; p++) {
     if (*p < 0x80) {
       if (std::isalnum(*p)) return true;
     } else if (*p == 0xE2 && (p[1] == 0x80 || p[1] == 0x81)) {
-      if (p[2] == 0) break;  // truncated sequence: skipping would step past the NUL
-      p += 2;                // skip the 3-byte General Punctuation codepoint
+      if (p[2] == 0) break;
+      p += 2;
     } else {
       return true;
     }
@@ -43,13 +40,9 @@ void DictionaryWordSelectActivity::onEnter() {
   Activity::onEnter();
   fontId = SETTINGS.getReaderFontId();
   lineHeight = renderer.getLineHeight(fontId);
-  // No null check: a failed allocation just disables the differential
-  // fast path (drawHighlightWithSnapshot skips the read), keeping the
-  // full-repaint path as the fallback.
-  snapshot = makeUniqueNoThrow<uint8_t[]>(SNAPSHOT_CAPACITY);
+  snapshotCapacity = SNAPSHOT_PLANE_CAPACITY * (renderer.uiGrayEnabled() ? 3 : 1);
+  snapshot = makeUniqueNoThrow<uint8_t[]>(snapshotCapacity);
   extractWords();
-  // Start on the middle row's word nearest mid-screen instead of top-left:
-  // any word on the page is then at most half a page of moves away.
   if (!words.empty()) {
     const int initial = closestInRow(rowCount / 2, renderer.getScreenWidth() / 2);
     if (initial >= 0) selected = initial;
@@ -62,11 +55,6 @@ void DictionaryWordSelectActivity::extractWords() {
   words.reserve(128);
   rowCount = 0;
 
-  // Single walk: collect the selectable words while accumulating their text
-  // and styles (~2KB transient string, freed on return). Widths are measured
-  // afterwards: merging the page's codepoints into the SD font's persistent
-  // advance table first keeps getTextAdvanceX on the in-RAM path instead of
-  // loading glyphs from SD one overflow slot at a time.
   std::string pageText;
   pageText.reserve(2048);
   uint8_t styleMask = 0;
@@ -88,7 +76,7 @@ void DictionaryWordSelectActivity::extractWords() {
       box.x = static_cast<int16_t>(line->xPos + block->wordXpos(i) + marginLeft);
       box.y = static_cast<int16_t>(line->yPos + marginTop + rubyShift);
       box.style = block->wordStyle(i);
-      box.width = 0;  // measured below, once the advance table is ready
+      box.width = 0;
       box.row = rowCount;
       box.text = text;
       words.push_back(box);
@@ -101,18 +89,15 @@ void DictionaryWordSelectActivity::extractWords() {
     if (rowHasWords) rowCount++;
   }
 
-  if (styleMask == 0) styleMask = 0x01;  // REGULAR
+  if (styleMask == 0) styleMask = 0x01;
   renderer.ensureSdCardFontReady(fontId, pageText.c_str(), styleMask);
   for (auto& word : words) {
     word.width = static_cast<int16_t>(renderer.getTextAdvanceX(fontId, word.text, word.style));
   }
 }
 
-// Index of the word whose box (with finger-sized slop) contains the touch
-// point; -1 when the touch lands on no word. Boxes never overlap after the
-// slop grows them, at worst they touch, so first hit wins.
 int DictionaryWordSelectActivity::wordAt(const int x, const int y) const {
-  constexpr int SLOP = 4;  // matches the highlight box (+2) plus finger error
+  constexpr int SLOP = 4;
   for (int i = 0; i < static_cast<int>(words.size()); i++) {
     const WordBox& word = words[i];
     if (x >= word.x - SLOP && x < word.x + word.width + SLOP && y >= word.y - SLOP && y < word.y + lineHeight + SLOP) {
@@ -122,8 +107,6 @@ int DictionaryWordSelectActivity::wordAt(const int x, const int y) const {
   return -1;
 }
 
-// Index of the word in `row` whose horizontal center is closest to centerX;
-// -1 when the row has no words.
 int DictionaryWordSelectActivity::closestInRow(const uint16_t row, const int centerX) const {
   int best = -1;
   int bestDistance = INT_MAX;
@@ -158,7 +141,7 @@ void DictionaryWordSelectActivity::performLookup() {
   }
   const bool indexing = dictOpenOk && dict.needsIndex();
   popupMsg = indexing ? StrId::STR_DICT_INDEXING : StrId::STR_DICT_LOOKING_UP;
-  requestUpdateAndWait();  // paint the page + busy popup before blocking on SD
+  requestUpdateAndWait();
 
   bool ok = dictOpenOk;
   Dictionary::IndexResult indexResult = Dictionary::IndexResult::Ok;
@@ -176,13 +159,8 @@ void DictionaryWordSelectActivity::performLookup() {
                            [this](const ActivityResult&) { requestUpdate(); });
     return;
   }
-  // Name the failure: a genuine miss is "Not found"; a word that WAS found but
-  // couldn't be read is a real error — and we distinguish decompression from a
-  // low-memory allocation from a generic read error.
   if (!ok) {
     popup = Popup::Error;
-    // An index build allocates a scan buffer, so it fails the same way lookups
-    // do on a fragmented heap — name that rather than a generic error.
     switch (indexResult) {
       case Dictionary::IndexResult::LowMemory:
         popupMsg = StrId::STR_DICT_LOW_MEMORY;
@@ -192,7 +170,7 @@ void DictionaryWordSelectActivity::performLookup() {
         break;
       case Dictionary::IndexResult::Ok:
       default:
-        popupMsg = StrId::STR_DICT_ERROR;  // dict.open() failed, not the index
+        popupMsg = StrId::STR_DICT_ERROR;
         break;
     }
   } else {
@@ -242,8 +220,6 @@ void DictionaryWordSelectActivity::loop() {
 
   if (words.empty()) return;
 
-  // Touch: a touch-down moves the highlight to the touched word (differential
-  // repaint), a tap on a word selects and looks it up in one go.
   int tx = 0;
   int ty = 0;
   if (mappedInput.wasScreenTouchDown(tx, ty)) {
@@ -277,17 +253,12 @@ void DictionaryWordSelectActivity::loop() {
   }
 }
 
-// Saves the pixels under words[selected]'s highlight box, then draws the
-// highlight over them. Returns false when the pixels could not be saved
-// (no buffer / oversize box) — the highlight is drawn regardless, but the
-// next cursor move must do a full repaint.
-bool DictionaryWordSelectActivity::drawHighlightWithSnapshot() {
+void DictionaryWordSelectActivity::drawHighlightWithSnapshot() {
   const WordBox& word = words[selected];
   int hx = word.x - 2;
   int hy = word.y - 2;
   int hw = word.width + 4;
   int hh = lineHeight + 4;
-  // Clamp to the panel so save, draw and restore all use the same box.
   if (hx < 0) {
     hw += hx;
     hx = 0;
@@ -297,31 +268,19 @@ bool DictionaryWordSelectActivity::drawHighlightWithSnapshot() {
     hy = 0;
   }
 
-  bool saved = false;
-  if (snapshot && hw > 0 && hh > 0) {
-    saved = renderer.readFramebufferRegion(hx, hy, hw, hh, snapshot.get(), SNAPSHOT_CAPACITY) > 0;
-  }
-  snapshotX = static_cast<int16_t>(hx);
-  snapshotY = static_cast<int16_t>(hy);
-  snapshotW = static_cast<int16_t>(hw);
-  snapshotH = static_cast<int16_t>(hh);
+  highlightSnapshot = {};
+  const size_t needed = renderer.regionSnapshotBytes(hx, hy, hw, hh);
+  const size_t limit = SNAPSHOT_PLANE_CAPACITY * (renderer.uiGrayEnabled() ? 3 : 1);
+  const bool saved = snapshot && needed > 0 && needed <= limit && needed <= snapshotCapacity &&
+                     renderer.captureRegion(hx, hy, hw, hh, {snapshot.get(), snapshotCapacity}, highlightSnapshot) ==
+                         GfxRenderer::FrameResult::Ok;
   snapshotIdx = saved ? selected : -1;
 
   renderer.fillRect(hx, hy, hw, hh, true);
   renderer.drawText(fontId, word.x, word.y, word.text, false, word.style);
-  return saved;
 }
 
-// Front-button bar (Back/Confirm/Left/Right). Drawn last on every repaint
-// path, including the differential highlight-only path, so it always ends
-// up as the top layer even when a highlighted word's box falls under a
-// hint's screen area. No side-button hints: Up/Down row jump has no spare
-// screen area on this page (it reuses the reader's full-bleed layout), and
-// a hint box there would hide text instead of sitting in a reserved gutter.
 void DictionaryWordSelectActivity::drawHints() const {
-  // No selectable word on this page: Confirm/Left/Right are all no-ops
-  // (guarded by words.empty() in loop()/performLookup), so only Back does
-  // anything and only Back is hinted.
   if (words.empty()) {
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -332,28 +291,30 @@ void DictionaryWordSelectActivity::drawHints() const {
 }
 
 void DictionaryWordSelectActivity::render(RenderLock&&) {
-  // Differential fast path: only the highlight moved and the framebuffer
-  // still holds a clean page (no popup or sub-activity since the last full
-  // repaint). Restore the pixels under the old highlight, draw the new one,
-  // and push — skipping the two-pass page render entirely.
-  if (popup == Popup::None && snapshotIdx >= 0 && !words.empty() && selected != snapshotIdx) {
-    renderer.writeFramebufferRegion(snapshotX, snapshotY, snapshotW, snapshotH, snapshot.get());
-    // The full path's PrewarmScope cleared the glyph cache on exit; batch-load
-    // just the highlighted word's glyphs before drawing them white-on-black.
-    renderer.getFontCacheManager()->prewarmCache(
-        fontId, words[selected].text, static_cast<uint8_t>(1u << (static_cast<uint8_t>(words[selected].style) & 0x03)));
-    if (drawHighlightWithSnapshot()) {
+  if (renderer.displayWorkAborted()) {
+    snapshotIdx = -1;
+    highlightSnapshot = {};
+    return;
+  }
+  if (renderer.liveFrameValid() && popup == Popup::None && snapshotIdx >= 0 && !words.empty() &&
+      selected != snapshotIdx) {
+    const auto restored = renderer.restoreRegion(highlightSnapshot);
+    if (restored == GfxRenderer::FrameResult::Ok && renderer.liveFrameValid()) {
+      renderer.getFontCacheManager()->prewarmCache(
+          fontId, words[selected].text,
+          static_cast<uint8_t>(1u << (static_cast<uint8_t>(words[selected].style) & 0x03)));
+      drawHighlightWithSnapshot();
       drawHints();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
       return;
     }
-    // Snapshot failed (oversize box) — fall through to a full repaint.
   }
 
+  snapshotIdx = -1;
+  highlightSnapshot = {};
+  if (renderer.displayWorkAborted()) return;
   renderer.clearScreen();
 
-  // Same prewarm-scan-then-render pass the reader uses, so SD-card fonts hit
-  // the in-RAM glyph cache during the real draw.
   auto* fcm = renderer.getFontCacheManager();
   auto scope = fcm->createPrewarmScope();
   page->render(renderer, fontId, marginLeft, marginTop);
@@ -367,11 +328,8 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
   drawHints();
 
   if (popup != Popup::None) {
-    // The popup overdraws the page, so the snapshot no longer matches the
-    // framebuffer — force the next render onto the full-repaint path.
     snapshotIdx = -1;
-    // drawPopup overlays the framebuffer and refreshes the display itself.
-    // I18N.get directly: tr() only accepts literal key names.
+    highlightSnapshot = {};
     GUI.drawPopup(renderer, I18N.get(popupMsg));
     return;
   }
