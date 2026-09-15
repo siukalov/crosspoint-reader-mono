@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 import zlib
@@ -12,6 +13,11 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "freeink-sdk/libs/display/FreeInkDisplay/src/driver"
+OPTIONAL_HOOK_LINK_FLAGS = [
+    f"-Wl,-U,_{symbol}" for symbol in (
+        "freeink_panel_submission_begin", "freeink_panel_submission_end", "freeink_panel_work_begin"
+    )
+] if sys.platform == "darwin" else []
 
 STUBS = {
     "Arduino.h": r"""
@@ -460,12 +466,190 @@ SCENARIOS = ("ordinary", "gray", "recovery", "reset", "resync", "cleanup", "stag
              "fail_recovery1", "fail_recovery2", "committed_cancel", "replace_fallback")
 
 
+SUBMISSION_CASES = r"""
+bool observing = false, dropObservation = false;
+unsigned beginCount = 0, endCount = 0, workCount = 0;
+uint32_t actualWork = 0, expectedGeneration = 1;
+bool expectedTarget = true, expectedEligible = true, expectedGray = false;
+bool expectedUnchanged = false, expectedRan = true, expectedAbort = false;
+uint8_t expectedBase = 0xCC;
+void equal(unsigned actual, unsigned expected, const char* message) {
+  if (actual != expected) {
+    std::fprintf(stderr, "FAIL %s expected=%u actual=%u\n", message, expected, actual);
+    std::exit(1);
+  }
+}
+extern "C" bool freeink_panel_capture_enabled() { return observing; }
+extern "C" void freeink_panel_capture_plane(uint8_t,uint32_t,uint16_t,uint16_t,uint32_t,const uint8_t*,uint16_t) {}
+extern "C" void freeink_panel_capture_activation(uint8_t,uint32_t,uint32_t) {}
+#ifndef OMIT_SUBMISSION_HOOKS
+extern "C" void freeink_panel_work_begin(uint32_t generation) {
+  ++workCount;
+  actualWork = generation;
+}
+extern "C" void freeink_panel_submission_begin(uint32_t generation, uint16_t width, uint16_t height, bool rotate180,
+                                               const uint8_t* base, const uint8_t* lsb, const uint8_t* msb, bool usesGray) {
+  equal(++beginCount, 1, "one submission begin");
+  equal(generation, expectedGeneration, "actual submission generation");
+  equal(width, 800, "submission width"); equal(height, 480, "submission height");
+  equal(rotate180, BoardConfig::ACTIVE.orientation.mirrorX, "actual driver transform");
+  equal(usesGray, expectedGray, "actual gray selection");
+  equal(base != nullptr, expectedTarget, "actual target presence");
+  equal(lsb != nullptr, expectedGray, "actual L presence"); equal(msb != nullptr, expectedGray, "actual M presence");
+  for (unsigned i = 0; i < 48000; ++i) {
+    if (base) equal(base[i], expectedBase, "actual pending B");
+    if (lsb) equal(lsb[i], 0x22, "actual staged L");
+    if (msb) equal(msb[i], 0x66, "actual staged M");
+  }
+  if (dropObservation) observing = false;
+}
+extern "C" void freeink_panel_submission_end(uint32_t generation, bool hadTarget, bool eligible, bool unchanged,
+                                             bool committedThisSubmission, bool aborted) {
+  equal(++endCount, 1, "one submission end");
+  equal(generation, expectedGeneration, "actual end generation");
+  equal(hadTarget, expectedTarget, "end target presence"); equal(eligible, expectedEligible, "end eligibility");
+  equal(unchanged, expectedUnchanged, "explicit unchanged outcome");
+  equal(committedThisSubmission, expectedRan, "per-call commitment"); equal(aborted, expectedAbort, "end abort state");
+}
+#endif
+void dumpTrace() {
+  for (const auto& event : events) {
+    std::printf("%c:%u:%lu:", event.kind, event.value, event.time);
+    for (auto byte : event.bytes) std::printf("%02x", byte);
+    std::puts("");
+  }
+  for (const auto& activation : activations) {
+    std::printf("A:%u:%lu:", activation.control, activation.time);
+    for (auto byte : activation.p24) std::printf("%02x", byte);
+    std::printf(":");
+    for (auto byte : activation.p26) std::printf("%02x", byte);
+    std::puts("");
+  }
+  for (const auto* plane : {&ram24, &ram26}) {
+    std::printf("RAM:");
+    for (auto byte : *plane) std::printf("%02x", byte);
+    std::puts("");
+  }
+  auto& d = freeink::ssd1683Driver();
+  std::printf("STATE:%lu:%u:%u:%u:%u\n", hostMillis, chunks, hostAllocationCalls,
+              d.displayCommitted(), d.postRefreshAborted());
+}
+int main(int argc, char** argv) {
+  require(argc == 2, "missing submission scenario");
+  const std::string argument = argv[1];
+  const auto scenario = argument.substr(0, argument.find(':'));
+  const bool rotated = argument.find(":rotated:") != std::string::npos;
+  const bool enabled = argument.find(":off") == std::string::npos;
+  BoardConfig::ACTIVE.orientation.mirrorX = BoardConfig::ACTIVE.orientation.mirrorY = rotated;
+  auto& d = freeink::ssd1683Driver();
+  std::array<uint8_t,48000> b,l,m;
+  b.fill(0xCC); l.fill(0x22); m.fill(0x66);
+  d.begin(hostBus); resetRecording(); d.beginDisplayWork();
+  if (scenario == "recovery") {
+    d.displayGrayscaleBase(hostBus,b.data(),freeink::RefreshMode::Fast,false);
+    d.copyGrayscaleLsb(hostBus,l.data()); d.copyGrayscaleMsb(hostBus,m.data());
+    d.displayGray(hostBus,m.data(),false,nullptr,false);
+    d.beginDisplayWork(); expectedGeneration = 2;
+  } else if (scenario == "unchanged" || scenario == "same_work") {
+    d.display(hostBus,b.data(),nullptr,freeink::RefreshMode::Fast,false);
+    if (scenario == "unchanged") {
+      d.beginDisplayWork(); d.beginDisplayWork(); expectedGeneration = 3;
+    }
+    expectedUnchanged = true; expectedRan = false;
+  }
+  resetRecording();
+  const bool gray = scenario == "gray" || scenario == "abort" || scenario == "cancel_transfer" ||
+                    scenario == "fail_busy" || scenario == "fail_reset" || scenario == "ineligible" ||
+                    scenario == "cleanup" || scenario == "drop";
+  if (gray) {
+    d.displayGrayscaleBase(hostBus,b.data(),freeink::RefreshMode::Fast,false);
+    d.copyGrayscaleLsb(hostBus,l.data()); d.copyGrayscaleMsb(hostBus,m.data());
+    b.fill(0xF0); l.fill(0x0F); m.fill(0xAA);
+    expectedGray = true;
+  }
+  if (scenario == "abort") {
+    d.abortPostRefresh(); expectedEligible = false; expectedGray = false; expectedRan = false; expectedAbort = true;
+  }
+  if (scenario == "ineligible") {
+    d._pendingGeneration = 0; expectedEligible = false; expectedGray = false; expectedRan = false;
+  }
+  if (scenario == "cancel_transfer") { cancelTransfer = true; expectedRan = false; expectedAbort = true; }
+  if (scenario == "fail_busy") { failWait = 3; expectedRan = false; }
+  if (scenario == "fail_reset") { failWait = 1; expectedRan = false; }
+  if (scenario == "no_target") { expectedTarget = false; expectedEligible = false; expectedRan = false; }
+  observing = enabled; dropObservation = scenario == "drop";
+  const auto allocationsBefore = hostAllocationCalls;
+  if (scenario == "cleanup") d.cleanupGrayscaleBuffers(hostBus,nullptr);
+  else if (gray || scenario == "no_target") d.displayGray(hostBus,b.data(),false,nullptr,false);
+  else d.display(hostBus,b.data(),nullptr,freeink::RefreshMode::Fast,false);
+#ifndef OMIT_SUBMISSION_HOOKS
+  equal(beginCount, enabled ? 1 : 0, "submission begin count");
+  equal(endCount, enabled ? 1 : 0, "submission end count");
+  equal(workCount, expectedGeneration, "genuine work notification count");
+  equal(actualWork, expectedGeneration, "genuine work generation");
+#endif
+  equal(hostAllocationCalls, allocationsBefore, "submission observation allocations");
+  equal(d.postRefreshAborted(), expectedAbort, "observation preserves abort");
+  if (scenario == "same_work") equal(d.displayCommitted(), true, "cumulative commitment remains true");
+  dumpTrace();
+}
+"""
+
+SUBMISSION_SCENARIOS = ("gray", "recovery", "normal_bw", "unchanged", "same_work", "abort", "cancel_transfer",
+                        "fail_busy", "fail_reset", "no_target", "ineligible", "cleanup", "drop")
+
+
+def submission_harness():
+    prefix = HARNESS[:HARNESS.index("int main(")]
+    prefix = prefix.replace('#include "HalDisplay.h"',
+                            '#include <atomic>\n#define private public\n#include "HalDisplay.h"\n#undef private')
+    return prefix + SUBMISSION_CASES
+
+
 class PanelDiagnosticTest(unittest.TestCase):
+    def test_submission_outcomes_and_bus_controls(self):
+        scenarios = [f"{scenario}:{orientation}" for scenario in SUBMISSION_SCENARIOS
+                     for orientation in ("native", "rotated")]
+        harness = submission_harness()
+        enabled = self.compile_and_run(harness, [scenario + ":on" for scenario in scenarios])
+        disabled = self.compile_and_run(harness, [scenario + ":off" for scenario in scenarios])
+        absent = self.compile_and_run("#define OMIT_SUBMISSION_HOOKS\n" + harness,
+                                      [scenario + ":on" for scenario in scenarios])
+        for scenario, actual, control, unlinked in zip(scenarios, enabled, disabled, absent):
+            with self.subTest(scenario=scenario):
+                self.assertEqual(actual, control, "hooks change commands, RAM, delays or driver state")
+                self.assertEqual(actual, unlinked, "optional hooks change commands, RAM, delays or driver state")
+
     def test_state_sequences(self):
         source = HARNESS[:HARNESS.index("int main(")] + STATE_CASES
         self.compile_and_run(source, SCENARIOS)
 
+    def test_submission_semantic_mutants(self):
+        source = (DRIVER / "Ssd1683Driver.cpp").read_text()
+        end = "freeink_panel_submission_end(_renderGeneration, hadTarget, eligible, unchanged, ran, displayWorkCancelled());"
+        mutants = (
+            ("omit submission end", end, "(void)0;", "gray:native:on",
+             "FAIL submission end count expected=1 actual=0"),
+            ("cumulative commitment", end, end.replace("unchanged, ran,", "unchanged, _displayCommitted,"),
+             "same_work:native:on", "FAIL per-call commitment expected=0 actual=1"),
+            ("wrong pending base", "hadTarget ? _pendingBw : nullptr", "hadTarget ? _grayLsb : nullptr",
+             "gray:native:on", "FAIL actual pending B expected=204 actual=34"),
+            ("wrong selector", "usesGray ? _grayLsb : nullptr", "usesGray ? _grayMsb : nullptr",
+             "gray:native:on", "FAIL actual staged L expected=34 actual=102"),
+            ("wrong driver generation", "freeink_panel_submission_begin(_renderGeneration,",
+             "freeink_panel_submission_begin(_renderGeneration + 1,", "gray:native:on",
+             "FAIL actual submission generation expected=1 actual=2"),
+            ("omit genuine work", "if (freeink_panel_work_begin) freeink_panel_work_begin(_renderGeneration);", "",
+             "gray:native:off", "FAIL genuine work notification count expected=1 actual=0"),
+        )
+        harness = submission_harness()
+        for name, old, new, scenario, failure in mutants:
+            with self.subTest(mutant=name):
+                self.assertEqual(source.count(old), 1, "mutant must have one exact production site")
+                self.compile_and_run(harness, (scenario,), source.replace(old, new), failure)
+
     def compile_and_run(self, source, scenarios, driver_source=None, failure=None):
+        outputs = []
         with tempfile.TemporaryDirectory(prefix="panel-state-") as temporary:
             directory = Path(temporary)
             for name, content in STUBS.items():
@@ -480,6 +664,7 @@ class PanelDiagnosticTest(unittest.TestCase):
             command = [os.environ.get("CXX", "c++"), "-std=c++17", "-DENABLE_SERIAL_LOG=1", "-I", str(directory),
                        "-I", str(DRIVER), "-I", str(ROOT / "lib/PanelDiagnostic"), str(harness),
                        str(driver_file), "-o", str(executable)]
+            command.extend(OPTIONAL_HOOK_LINK_FLAGS)
             compiled = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
             for scenario in scenarios:
@@ -487,9 +672,12 @@ class PanelDiagnosticTest(unittest.TestCase):
                     result = subprocess.run([str(executable), scenario], capture_output=True, text=True)
                     if failure is None:
                         self.assertEqual(result.returncode, 0, result.stderr)
+                        outputs.append(result.stdout)
                     else:
                         self.assertNotEqual(result.returncode, 0, "semantic mutant survived")
                         self.assertIn(failure, result.stderr)
+                        print(result.stderr.strip())
+        return outputs
 
     def test_semantic_mutants(self):
         source = (DRIVER / "Ssd1683Driver.cpp").read_text()
@@ -536,6 +724,7 @@ class PanelDiagnosticTest(unittest.TestCase):
                 str(harness), str(ROOT / "lib/PanelDiagnostic/PanelDiagnostic.cpp"),
                 str(DRIVER / "Ssd1683Driver.cpp"), str(miniz_object), "-o", str(executable),
             ]
+            command.extend(OPTIONAL_HOOK_LINK_FLAGS)
             compiled = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
             result = subprocess.run([str(executable), str(directory)], capture_output=True, text=True)

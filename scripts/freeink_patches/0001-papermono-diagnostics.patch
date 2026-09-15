@@ -1,8 +1,8 @@
 diff --git a/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp b/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp
-index c79227b..522439e 100644
+index c79227b..6a9c051 100644
 --- a/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp
 +++ b/libs/display/FreeInkDisplay/src/driver/Ssd1683Driver.cpp
-@@ -7,12 +7,15 @@
+@@ -7,12 +7,21 @@
  #include <array>
  #include <cstring>
  
@@ -13,6 +13,12 @@ index c79227b..522439e 100644
 +    __attribute__((weak));
 +extern "C" void freeink_panel_capture_completion(uint8_t control, uint32_t generation, uint32_t busyMs, bool completed)
 +    __attribute__((weak));
++extern "C" void freeink_panel_submission_begin(uint32_t generation, uint16_t width, uint16_t height, bool rotate180,
++                                               const uint8_t* base, const uint8_t* lsb, const uint8_t* msb,
++                                               bool usesGray) __attribute__((weak));
++extern "C" void freeink_panel_submission_end(uint32_t generation, bool hadTarget, bool eligible, bool unchanged,
++                                             bool committedThisSubmission, bool aborted) __attribute__((weak));
++extern "C" void freeink_panel_work_begin(uint32_t generation) __attribute__((weak));
 +
  #if FREEINK_WAVEFORM_LAB && __has_include("PaperMonoWaveformBaked.h")
 -// Optional waveform-editor export ("bake"): defines PAPER_MONO_WAVEFORM_BAKED_PAGE
@@ -23,7 +29,7 @@ index c79227b..522439e 100644
  #include "PaperMonoWaveformBaked.h"
  #endif
  
-@@ -27,17 +30,9 @@ constexpr uint16_t WIDTH_BYTES = WIDTH / 8;
+@@ -27,17 +36,9 @@ constexpr uint16_t WIDTH_BYTES = WIDTH / 8;
  constexpr uint32_t BUFFER_SIZE = static_cast<uint32_t>(WIDTH_BYTES) * HEIGHT;
  constexpr uint16_t ROTATE_CHUNK_BYTES = 16384;
  
@@ -41,7 +47,7 @@ index c79227b..522439e 100644
  constexpr uint8_t CTRL_OTP_BW_HOLD = 0xFC;
  
  // Source driving voltage selectors inside a LUT phase, two bits per sub-phase.
-@@ -45,38 +40,15 @@ constexpr uint8_t VS_BLACK = 0x01;  // VSH1, +15 V
+@@ -45,38 +46,15 @@ constexpr uint8_t VS_BLACK = 0x01;  // VSH1, +15 V
  constexpr uint8_t VS_WHITE = 0x02;  // VSL,  -15 V
  constexpr uint8_t VS_WEAK = 0x03;   // VSH2, +5 V
  
@@ -80,7 +86,7 @@ index c79227b..522439e 100644
  DRAM_ATTR uint8_t ROTATE_CHUNK[ROTATE_CHUNK_BYTES];
  
  constexpr std::array<uint8_t, 256> makeReverseBitsLut() {
-@@ -91,26 +63,12 @@ constexpr std::array<uint8_t, 256> makeReverseBitsLut() {
+@@ -91,26 +69,12 @@ constexpr std::array<uint8_t, 256> makeReverseBitsLut() {
  }
  constexpr auto REVERSE_BITS_LUT = makeReverseBitsLut();
  
@@ -107,7 +113,7 @@ index c79227b..522439e 100644
  struct WaveLut {
    uint8_t b[111];
  
-@@ -196,8 +154,6 @@ void Ssd1683Driver::waveLabClear(uint8_t slot) {
+@@ -196,8 +160,6 @@ void Ssd1683Driver::waveLabClear(uint8_t slot) {
  
  bool Ssd1683Driver::waveLabGet(uint8_t slot, uint8_t out[WAVELAB_LUT_BYTES]) const {
    if (slot > WAVELAB_SLOT_CORRECTIVE || !out) return false;
@@ -116,7 +122,7 @@ index c79227b..522439e 100644
    uint8_t effective = slot;
    if (slot == WAVELAB_SLOT_CORRECTIVE && !(_labActive & (1u << WAVELAB_SLOT_CORRECTIVE)) &&
        (_labActive & (1u << WAVELAB_SLOT_PAGE))) {
-@@ -208,8 +164,6 @@ bool Ssd1683Driver::waveLabGet(uint8_t slot, uint8_t out[WAVELAB_LUT_BYTES]) con
+@@ -208,8 +170,6 @@ bool Ssd1683Driver::waveLabGet(uint8_t slot, uint8_t out[WAVELAB_LUT_BYTES]) con
      return true;
    }
  #ifdef PAPER_MONO_WAVEFORM_BAKED_PAGE
@@ -125,7 +131,7 @@ index c79227b..522439e 100644
    if (_labActive == 0) {
      const uint8_t* baked = nullptr;
      if (slot == WAVELAB_SLOT_STAGE2) {
-@@ -231,10 +185,6 @@ bool Ssd1683Driver::waveLabGet(uint8_t slot, uint8_t out[WAVELAB_LUT_BYTES]) con
+@@ -231,10 +191,6 @@ bool Ssd1683Driver::waveLabGet(uint8_t slot, uint8_t out[WAVELAB_LUT_BYTES]) con
      }
    }
  #endif
@@ -136,7 +142,7 @@ index c79227b..522439e 100644
    if (slot == WAVELAB_SLOT_STAGE2) {
      makePostCleanLut(out);
    } else {
-@@ -252,9 +202,6 @@ uint16_t Ssd1683Driver::labSelectPageLut(bool corrective, uint8_t out[WAVELAB_LU
+@@ -252,9 +208,6 @@ uint16_t Ssd1683Driver::labSelectPageLut(bool corrective, uint8_t out[WAVELAB_LU
                                           const uint8_t** labVolts) const {
    *labVolts = nullptr;
    const uint8_t* src = nullptr;
@@ -146,7 +152,7 @@ index c79227b..522439e 100644
    if (_labActive != 0) {
      if (corrective && (_labActive & (1u << WAVELAB_SLOT_CORRECTIVE))) {
        src = _labLut[WAVELAB_SLOT_CORRECTIVE];
-@@ -293,8 +240,6 @@ bool Ssd1683Driver::allocateBuffers() {
+@@ -293,8 +246,6 @@ bool Ssd1683Driver::allocateBuffers() {
    const bool ok = alloc(_lastBw, BUFFER_SIZE) && alloc(_pendingBw, BUFFER_SIZE) && alloc(_grayLsb, BUFFER_SIZE) &&
                    alloc(_grayMsb, BUFFER_SIZE) && alloc(_glassNonWhite, BUFFER_SIZE) &&
                    alloc(_glassBlack, BUFFER_SIZE) && alloc(_sel24, BUFFER_SIZE) && alloc(_sel26, BUFFER_SIZE);
@@ -155,7 +161,7 @@ index c79227b..522439e 100644
    if (glassWasMissing && ok) {
      memset(_glassNonWhite, 0, BUFFER_SIZE);
      memset(_glassBlack, 0, BUFFER_SIZE);
-@@ -330,14 +275,9 @@ void Ssd1683Driver::initController(EpdBus& bus) {
+@@ -330,14 +281,9 @@ void Ssd1683Driver::initController(EpdBus& bus) {
    bus.data(static_cast<uint8_t>((HEIGHT - 1) & 0xFF));
    bus.data(static_cast<uint8_t>((HEIGHT - 1) >> 8));
    bus.data(0x02);
@@ -170,7 +176,7 @@ index c79227b..522439e 100644
    bus.data(0x02);
  
    bus.cmd(0x44);
-@@ -373,32 +313,42 @@ void Ssd1683Driver::resetRamCounter(EpdBus& bus) {
+@@ -373,32 +319,42 @@ void Ssd1683Driver::resetRamCounter(EpdBus& bus) {
  
  void Ssd1683Driver::writePlane(EpdBus& bus, uint8_t command, const uint8_t* data) {
    if (!data) return;
@@ -216,7 +222,7 @@ index c79227b..522439e 100644
  }
  
  void Ssd1683Driver::activateOtp(EpdBus& bus) {
-@@ -416,9 +366,6 @@ void Ssd1683Driver::powerOffController(EpdBus& bus) {
+@@ -416,9 +372,6 @@ void Ssd1683Driver::powerOffController(EpdBus& bus) {
  
  void Ssd1683Driver::loadCustomLut(EpdBus& bus, const uint8_t lut[111]) {
  #if FREEINK_WAVEFORM_LAB
@@ -226,7 +232,7 @@ index c79227b..522439e 100644
    if (_labVolts) {
      bus.cmd(0x32);
      bus.data(lut, 105);
-@@ -434,9 +381,6 @@ void Ssd1683Driver::loadCustomLut(EpdBus& bus, const uint8_t lut[111]) {
+@@ -434,9 +387,6 @@ void Ssd1683Driver::loadCustomLut(EpdBus& bus, const uint8_t lut[111]) {
  #endif
    bus.cmd(0x32);
    bus.data(lut, 105);
@@ -236,7 +242,7 @@ index c79227b..522439e 100644
    bus.cmd(0x03);
    bus.data(VOLT_VGH);
    static constexpr uint8_t source[3] = {VOLT_VSH1, VOLT_VSH2, VOLT_VSL};
-@@ -446,13 +390,6 @@ void Ssd1683Driver::loadCustomLut(EpdBus& bus, const uint8_t lut[111]) {
+@@ -446,13 +396,6 @@ void Ssd1683Driver::loadCustomLut(EpdBus& bus, const uint8_t lut[111]) {
    _lutState = LutState::Custom;
  }
  
@@ -250,7 +256,7 @@ index c79227b..522439e 100644
  uint16_t Ssd1683Driver::makePostCleanLut(uint8_t out[111]) const {
    WaveLut lut;
    lut.clear();
-@@ -483,58 +420,10 @@ uint16_t Ssd1683Driver::makePostCleanLut(uint8_t out[111]) const {
+@@ -483,58 +426,10 @@ uint16_t Ssd1683Driver::makePostCleanLut(uint8_t out[111]) const {
    return totalFrames;
  }
  
@@ -309,7 +315,7 @@ index c79227b..522439e 100644
      p.grayKick = CORRECTIVE_PRE_UP;
      p.tBlack = CORRECTIVE_T_BLACK;
      p.packedErase = false;
-@@ -553,10 +442,6 @@ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
+@@ -553,10 +448,6 @@ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
    uint8_t group = 0;
    uint16_t frames = 0;
  
@@ -320,7 +326,7 @@ index c79227b..522439e 100644
    if (grayKick > 0) {
      lut.setVs(1, group, 0, VS_BLACK);
      lut.setVs(2, group, 0, VS_BLACK);
-@@ -585,17 +470,10 @@ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
+@@ -585,17 +476,10 @@ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
        static_cast<uint16_t>(tail - trajectory[2]),
    };
  
@@ -338,7 +344,7 @@ index c79227b..522439e 100644
    uint16_t bounds[8] = {
        0,
        erasePackStart,
-@@ -640,12 +518,6 @@ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
+@@ -640,12 +524,6 @@ uint16_t Ssd1683Driver::makeTriLut(uint8_t out[111], bool corrective) const {
    return frames;
  }
  
@@ -351,7 +357,7 @@ index c79227b..522439e 100644
  bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forceAll) {
    if (!bwTarget || !allocateBuffers()) return false;
    if (!_initialized) {
-@@ -653,11 +525,6 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
+@@ -653,11 +531,6 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
      initController(bus);
    }
  
@@ -363,7 +369,7 @@ index c79227b..522439e 100644
    uint8_t changedBits = 0;
  #ifdef ENABLE_SERIAL_LOG
    uint32_t changed = 0;
-@@ -683,19 +550,17 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
+@@ -683,19 +556,17 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
      changed += popcount8(changedMask);
  #endif
  
@@ -385,7 +391,7 @@ index c79227b..522439e 100644
    activateOtp(bus);
  
    for (uint32_t i = 0; i < BUFFER_SIZE; ++i) {
-@@ -703,10 +568,7 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
+@@ -703,10 +574,7 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
      _glassNonWhite[i] = black;
      _glassBlack[i] = black;
    }
@@ -396,7 +402,7 @@ index c79227b..522439e 100644
  #if FREEINK_EPD_TIMING_LOG
    Serial.printf("[%lu] SSD1677 OTP B/W: changed=%lu forced=%u elapsed=%lums\n", millis(),
                  static_cast<unsigned long>(changed), static_cast<unsigned>(forceAll), millis() - started);
-@@ -718,197 +580,182 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
+@@ -718,197 +586,201 @@ bool Ssd1683Driver::runOtpUpdate(EpdBus& bus, const uint8_t* bwTarget, bool forc
    return true;
  }
  
@@ -494,7 +500,8 @@ index c79227b..522439e 100644
 +    bus.data(0x01);
 +    bus.cmd(0x21);
 +    bus.data(0x00);
-+  }
+   }
+-  if (changedBits == 0) return false;
 +  bus.cmd(0x11);
 +  bus.data(0x02);
 +  const uint8_t xRange[] = {0x1F, 0x03, 0x00, 0x00};
@@ -509,8 +516,7 @@ index c79227b..522439e 100644
 +    bus.data(0x80);
 +    bus.cmd(0x1A);
 +    bus.data(0x5A);
-   }
--  if (changedBits == 0) return false;
++  }
 +  return true;
 +}
  
@@ -674,10 +680,27 @@ index c79227b..522439e 100644
 -    _pendingCorrective = false;
 -    clearGrayStaging();
 -    return false;
--  }
 +void Ssd1683Driver::commitPending(EpdBus& bus, bool useGray) {
-+  if (!_pendingTri) return;
-+  const bool eligible = _pendingGeneration == _renderGeneration && !displayWorkCancelled();
++  const bool hadTarget = _pendingTri;
++  const bool eligible = hadTarget && _pendingGeneration == _renderGeneration && !displayWorkCancelled();
++  const bool usesGray = eligible && useGray && grayStagingReady();
++  const bool capture = freeink_panel_capture_enabled && freeink_panel_submission_begin &&
++                       freeink_panel_submission_end && freeink_panel_capture_enabled();
++  if (capture) {
++    const bool rotate180 = BoardConfig::ACTIVE.orientation.mirrorX && BoardConfig::ACTIVE.orientation.mirrorY;
++    freeink_panel_submission_begin(_renderGeneration, WIDTH, HEIGHT, rotate180, hadTarget ? _pendingBw : nullptr,
++                                   usesGray ? _grayLsb : nullptr, usesGray ? _grayMsb : nullptr, usesGray);
++  }
++  bool ran = false;
++  bool unchanged = false;
++  const auto finishSubmission = [&]() {
++    if (capture)
++      freeink_panel_submission_end(_renderGeneration, hadTarget, eligible, unchanged, ran, displayWorkCancelled());
++  };
++  if (!hadTarget) {
++    finishSubmission();
++    return;
+   }
 +  const bool corrective = _pendingCorrective || _needsFull;
    _pendingTri = false;
 -  const bool corrective = _pendingCorrective;
@@ -687,24 +710,25 @@ index c79227b..522439e 100644
 -  if (_lastBw && (ran || !corrective)) {
 -    memcpy(_lastBw, _pendingBw, BUFFER_SIZE);
 -    _lastBwValid = true;
-+  bool ran = false;
 +  if (eligible) {
-+    if (useGray && grayStagingReady())
++    if (usesGray)
 +      ran = runVendorGray(bus, _pendingBw);
 +    else if (_needsBwRecovery)
 +      ran = runBwRecovery(bus, _pendingBw);
-+    else if (!corrective && _lastBwValid && memcmp(_lastBw, _pendingBw, BUFFER_SIZE) == 0)
++    else if (!corrective && _lastBwValid && memcmp(_lastBw, _pendingBw, BUFFER_SIZE) == 0) {
 +      _lastBwGeneration = _renderGeneration;
-+    else {
++      unchanged = true;
++    } else {
 +      ran = runOtpUpdate(bus, _pendingBw, corrective);
 +      if (ran) _needsFull = false;
 +    }
-+  }
+   }
+-  if (!useGray) _panelHasGray = false;
 +  if (ran) {
 +    recordBwTarget(_pendingBw);
 +    _displayCommitted = true;
-   }
--  if (!useGray) _panelHasGray = false;
++  }
++  finishSubmission();
    clearGrayStaging();
 -  return ran;
  }
@@ -739,7 +763,7 @@ index c79227b..522439e 100644
  }
  
  bool Ssd1683Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
-@@ -917,36 +764,28 @@ bool Ssd1683Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
+@@ -917,39 +789,32 @@ bool Ssd1683Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
  }
  
  void Ssd1683Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
@@ -781,7 +805,11 @@ index c79227b..522439e 100644
    _pendingTri = false;
    _pendingCorrective = false;
    clearGrayStaging();
-@@ -1011,96 +850,43 @@ void Ssd1683Driver::writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const
++  if (freeink_panel_work_begin) freeink_panel_work_begin(_renderGeneration);
+ }
+ 
+ bool Ssd1683Driver::displayWorkCancelled() const { return _abortGeneration.load() != _displayWorkGeneration; }
+@@ -1011,96 +876,43 @@ void Ssd1683Driver::writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const
    ready = markGrayRows(plane, yStart, numRows);
  }
  
@@ -890,7 +918,7 @@ index c79227b..522439e 100644
    bus.cmd(0x10);
    bus.data(0x03);  // SSD1677 deep-sleep key; 0x01 does not enter sleep.
    delay(2);
-@@ -1112,27 +898,12 @@ void Ssd1683Driver::setGrayParams(const Ssd1683GrayParams& params) {
+@@ -1112,27 +924,12 @@ void Ssd1683Driver::setGrayParams(const Ssd1683GrayParams& params) {
    _grayParams = params;
    if (_grayParams.lightFrames == 0) _grayParams.lightFrames = 1;
    if (_grayParams.lightFrames > 12) _grayParams.lightFrames = 12;
@@ -918,7 +946,7 @@ index c79227b..522439e 100644
    const uint8_t fundedByGray = static_cast<uint8_t>(_tri.tGray / 3);
    _tri.grayKick = fundedByGray >= GRAY_RESET_FRAMES ? 0 : static_cast<uint8_t>(GRAY_RESET_FRAMES - fundedByGray);
  }
-@@ -1145,7 +916,6 @@ void Ssd1683Driver::requestResync(uint8_t settlePasses) {
+@@ -1145,7 +942,6 @@ void Ssd1683Driver::requestResync(uint8_t settlePasses) {
  }
  
  void Ssd1683Driver::resetGray() {
@@ -926,7 +954,7 @@ index c79227b..522439e 100644
    clearGrayStaging();
    _pendingTri = false;
    _pendingCorrective = false;
-@@ -1164,10 +934,6 @@ void Ssd1683Driver::clearGrayStaging() {
+@@ -1164,10 +960,6 @@ void Ssd1683Driver::clearGrayStaging() {
  }
  
  void Ssd1683Driver::deepSleep(EpdBus& bus) {
