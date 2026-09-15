@@ -138,6 +138,24 @@ extern "C" void* memcpy(void* destination, const void* source, size_t size)
   }
   return result;
 }
+static int scratchAllocationCalls = 0;
+static int failScratchAllocation = 0;
+extern "C" void* gfx_malloc(size_t size) noexcept {
+  ++scratchAllocationCalls;
+  if (scratchAllocationCalls == failScratchAllocation) return nullptr;
+  return std::malloc(size);
+}
+struct ScratchChunks {
+  using type = std::vector<uint8_t*> GfxRenderer::*;
+  friend type scratchChunksMember(ScratchChunks);
+};
+template <ScratchChunks::type Member> struct ScratchAccess {
+  friend ScratchChunks::type scratchChunksMember(ScratchChunks) { return Member; }
+};
+template struct ScratchAccess<&GfxRenderer::bwBufferChunks>;
+static std::vector<uint8_t*>& scratchChunks(GfxRenderer& renderer) {
+  return renderer.*scratchChunksMember(ScratchChunks{});
+}
 static bool lent = false;
 static bool aborted = false;
 static int submissions = 0;
@@ -146,6 +164,12 @@ static int baseSubmissions = 0;
 static int asyncSubmissions = 0;
 static int grayCopies = 0;
 static int workStarts = 0;
+static int cleanupCalls = 0;
+static int cleanupSubmissions = 0;
+static bool pendingCleanup = false;
+static bool cleanupSawComplete = false;
+static GfxRenderer* cleanupRenderer = nullptr;
+static std::array<uint8_t, 48000> cleanupB{};
 static HalDisplay::RefreshMode lastFallback = HalDisplay::FAST_REFRESH;
 static bool lastFadingFix = false;
 static std::array<uint8_t, 48000> stagedB{}, stagedL{}, stagedM{};
@@ -177,6 +201,17 @@ void HalDisplay::copyGrayscaleLsbBuffers(const uint8_t* source) { ++grayCopies; 
 void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* source) { ++grayCopies; std::memcpy(stagedM.data(), source, 48000); }
 void HalDisplay::writeGrayscalePlaneStrip(bool lsb, const uint8_t* source, uint16_t y, uint16_t rows) {
   std::memcpy((lsb ? stagedL : stagedM).data() + y * 100, source, rows * 100);
+}
+void HalDisplay::prepareGrayscaleTarget() { pendingCleanup = true; }
+void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* source) {
+  ++cleanupCalls;
+  std::memcpy(cleanupB.data(), source, cleanupB.size());
+  if (pendingCleanup && !aborted) {
+    ++cleanupSubmissions;
+    cleanupSawComplete = cleanupRenderer && cleanupRenderer->liveFrameValid() &&
+                        cleanupRenderer->getFrameOwner() == GfxRenderer::FrameOwner::ReaderBase;
+  }
+  pendingCleanup = false;
 }
 void HalDisplay::displayGrayBuffer(bool fading) { ++graySubmissions; lastFadingFix = fading; }
 bool HalDisplay::supportsAsyncRefresh() const { return true; }
@@ -373,8 +408,13 @@ static void testOwnership(HalDisplay& hal, GfxRenderer& renderer) {
           "secondary alias cannot publish or blend before full rebuild");
   renderer.clearScreen();
   uint8_t rebuilt = 0;
-  require(renderer.liveFrameValid() && renderer.readFramebufferRegion(0, 0, 8, 1, &rebuilt, 1) == 1 && rebuilt == 0xFF,
-          "secondary alias full rebuild restores usable live frame");
+  GfxRenderer::FrameSnapshot rebuiltSnapshot;
+  std::array<uint8_t, 3> rebuiltTuple{};
+  require(renderer.liveFrameValid() && renderer.captureRegion(0, 0, 8, 1,
+              {rebuiltTuple.data(), rebuiltTuple.size()}, rebuiltSnapshot) == GfxRenderer::FrameResult::Ok &&
+              rebuiltTuple[0] == 0xFF, "secondary alias full rebuild restores usable live frame");
+  require(renderer.readFramebufferRegion(0, 0, 8, 1, &rebuilt, 1) == 0 && rebuilt == 0,
+          "retained legacy capture rejected after successful rebuild");
   const auto beforeLoan = renderer.getTargetGeneration();
   {
     GfxRenderer::FrameBufferLoan loan(renderer);
@@ -1764,6 +1804,206 @@ static void testFrameReplacement(HalDisplay& hal) {
   require(halActivity() == beforeLegacy, "legacy replacement makes no HAL call");
 }
 
+static void testReaderScratchOwnership(HalDisplay& hal) {
+  using Owner = GfxRenderer::FrameOwner;
+  GfxRenderer renderer(hal); renderer.begin(); renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  require(renderer.setUiGrayEnabled(true), "scratch enables retention");
+  renderer.clearScreen();
+  require(!renderer.storeReaderBwScratch() && !renderer.restoreReaderBwScratch(), "live UI refuses owned scratch methods");
+  std::array<uint8_t, 48000> saved;
+  for (size_t i = 0; i < saved.size(); ++i) saved[i] = static_cast<uint8_t>(0xCC + i * 13);
+  physical = saved;
+  const int beforeCleanup = cleanupCalls;
+  {
+    GfxRenderer::ScopedTarget owner(renderer, Owner::ReaderScratch);
+    require(renderer.storeReaderBwScratch(), "owning scratch saves B");
+    const auto chunks = scratchChunks(renderer);
+    physical.fill(0x55);
+    require(!renderer.storeReaderBwScratch() && scratchChunks(renderer) == chunks,
+            "second save leaves original chunks owned");
+    {
+      GfxRenderer::ScopedTarget inner(renderer, Owner::ReaderScratch);
+      require(!renderer.storeReaderBwScratch(), "nested scratch cannot replace saved B");
+      require(!renderer.restoreReaderBwScratch(), "unmatched scratch restore rejected");
+      require(physical[0] == 0x55 && scratchChunks(renderer) == chunks, "unmatched restore leaves outer storage intact");
+    }
+    {
+      std::array<uint8_t, 100> band{};
+      GfxRenderer::ScopedTarget offscreen(renderer, band.data(), 0, 1);
+      require(!renderer.storeReaderBwScratch() && !renderer.restoreReaderBwScratch(), "offscreen cannot consume outer B");
+    }
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+    renderer.setRenderMode(GfxRenderer::BW);
+    require(renderer.restoreReaderBwScratch(), "outer restore survives nested scopes and mode changes");
+    expect(physical.data(), saved.data(), saved.size(), "owned scratch restores complete original B");
+    require(!renderer.restoreReaderBwScratch(), "restored chunks cannot be consumed twice");
+    require(renderer.liveFrameNeedsRedraw(), "scratch B restoration alone cannot certify tuple");
+  }
+  require(cleanupCalls == beforeCleanup, "CPU scratch restoration never calls cleanup");
+
+  for (int boundary = 0; boundary < 4; ++boundary) {
+    renderer.beginDisplayWork(); renderer.clearScreen(); physical = saved;
+    std::array<uint8_t, 100> boundaryBand{};
+    {
+      GfxRenderer::ScopedTarget owner(renderer, Owner::ReaderScratch);
+      require(renderer.storeReaderBwScratch(), "boundary fixture saves B");
+      physical.fill(0x33);
+      if (boundary == 0) {
+        renderer.beginDisplayWork();
+        require(!renderer.restoreReaderBwScratch(), "new work rejects stale scratch save");
+        require(physical[0] == 0x33, "stale restore preserves new operation bytes");
+        for (const auto* chunk : scratchChunks(renderer)) require(!chunk, "new work immediately discards saved chunks");
+      }
+      if (boundary == 2) renderer.beginStripTarget(boundaryBand.data(), 0, 1);
+      if (boundary == 3) {
+        renderer.setOrientation(GfxRenderer::Portrait);
+        renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+        require(!renderer.restoreReaderBwScratch(), "orientation recovery rejects stale scratch save");
+      }
+    }
+    for (const auto* chunk : scratchChunks(renderer)) require(!chunk, "owner exit and new work discard saved chunks");
+    GfxRenderer::ScopedTarget other(renderer, Owner::ReaderScratch);
+    require(!renderer.restoreReaderBwScratch(), "different owner cannot restore expired save");
+    require(renderer.storeReaderBwScratch() && renderer.restoreReaderBwScratch(), "new owner can create its own save");
+  }
+
+  for (int failAt : {1, 3, 6}) {
+    renderer.beginDisplayWork(); renderer.clearScreen(); physical = saved;
+    GfxRenderer::ScopedTarget owner(renderer, Owner::ReaderScratch);
+    failScratchAllocation = scratchAllocationCalls + failAt;
+    require(!renderer.storeReaderBwScratch(), "scratch allocation failure rejects save");
+    failScratchAllocation = 0;
+    expect(physical.data(), saved.data(), saved.size(), "allocation failure preserves all B bytes");
+    for (const auto* chunk : scratchChunks(renderer)) require(!chunk, "allocation failure frees every allocated chunk");
+    physical.fill(0x33);
+    const auto unchanged = physical;
+    require(!renderer.restoreReaderBwScratch(), "failed allocation leaves no restorable save");
+    expect(physical.data(), unchanged.data(), unchanged.size(), "failed save restore writes no B bytes");
+    require(renderer.storeReaderBwScratch() && renderer.restoreReaderBwScratch(), "allocation failure permits later save");
+  }
+  renderer.beginDisplayWork(); renderer.clearScreen(); physical = saved;
+  {
+    GfxRenderer::ScopedTarget owner(renderer, Owner::ReaderScratch);
+    require(renderer.storeReaderBwScratch(), "missing chunk fixture saves B");
+    auto& chunks = scratchChunks(renderer);
+    std::free(chunks.back()); chunks.back() = nullptr;
+    physical.fill(0x33);
+    const auto unchanged = physical;
+    require(!renderer.restoreReaderBwScratch(), "missing final chunk rejects restore");
+    expect(physical.data(), unchanged.data(), unchanged.size(), "missing final chunk rejects before any B write");
+    for (const auto* chunk : chunks) require(!chunk, "missing chunk discards unusable save");
+  }
+  for (bool inputAbort : {false, true}) {
+    renderer.beginDisplayWork(); renderer.clearScreen(); physical = saved;
+    {
+      GfxRenderer::ScopedTarget owner(renderer, Owner::ReaderScratch);
+      require(renderer.storeReaderBwScratch(), "cancelled cleanup saves B");
+      physical.fill(0x33);
+      if (inputAbort) renderer.abortDisplayWork(); else owner.cancel();
+      require(renderer.restoreReaderBwScratch(), "same work cancelled cleanup restores B");
+      expect(physical.data(), saved.data(), saved.size(), "cancelled cleanup restores complete B");
+      require(renderer.liveFrameNeedsRedraw() && !renderer.finishReaderImport(), "cancelled cleanup cannot certify tuple");
+    }
+  }
+  require(cleanupCalls == beforeCleanup, "cancelled CPU restoration never calls cleanup");
+}
+
+static void testReaderScratchImport(HalDisplay& hal) {
+  using Owner = GfxRenderer::FrameOwner;
+  GfxRenderer renderer(hal); renderer.begin(); renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  require(renderer.setUiGrayEnabled(true), "scratch import enables retention");
+  for (bool inputAbort : {false, true}) {
+    renderer.beginDisplayWork(); renderer.clearScreen();
+    require(renderer.drawCoverage(1, 2, 2), "scratch import seeds outside gray marker");
+    const uint8_t* liveL = renderer.getLiveGrayPlane(true);
+    const uint8_t* liveM = renderer.getLiveGrayPlane(false);
+    const auto savedB = physical;
+    std::array<uint8_t, 100> ls{}, ms{}; ls[0] = 0x10; ms[0] = 0x18;
+    std::array<uint8_t, 48000> expectedL{}, expectedM{};
+    expectedL[200] = 0x50; expectedM[200] = 0x58;
+    const int callsBefore = cleanupCalls;
+    const int commitsBefore = cleanupSubmissions;
+    cleanupRenderer = &renderer;
+    {
+      GfxRenderer::ScopedTarget owner(renderer, Owner::ReaderScratch);
+      require(renderer.storeReaderBwScratch() && renderer.beginReaderImport(2, 2, 4, 1), "save B before clipped scratch import");
+      renderer.prepareGrayscaleTarget();
+      renderer.clearScreen(0);
+      require(renderer.importReaderPlane(true, ls.data(), ls.size(), 2, 1) &&
+              renderer.importReaderPlane(false, ms.data(), ms.size(), 2, 1), "scratch import replaces both selectors");
+      require(!renderer.finishReaderImport(), "scratch import lacks B coverage until restoration");
+      if (inputAbort) renderer.abortDisplayWork();
+      require(renderer.restoreReaderBwScratch(), "scratch import restores B coverage");
+      require(cleanupCalls == callsBefore && cleanupSubmissions == commitsBefore && pendingCleanup,
+              "scratch restore leaves pending cleanup untouched");
+      require(renderer.liveFrameNeedsRedraw(), "scratch restore waits for explicit import finish");
+      expect(physical.data(), savedB.data(), savedB.size(), "scratch import restores saved B exactly");
+      expect(liveL, expectedL.data(), expectedL.size(), "scratch restore preserves L and gray marker");
+      expect(liveM, expectedM.data(), expectedM.size(), "scratch restore preserves M and gray marker");
+      require(renderer.finishReaderImport() == !inputAbort, "scratch B coverage completes only noncancelled import");
+    }
+    {
+      GfxRenderer::ScopedTarget base(renderer, Owner::ReaderBase);
+      renderer.cleanupGrayscaleWithFrameBuffer();
+    }
+    require(cleanupCalls == callsBefore + 1 && cleanupSubmissions == commitsBefore + !inputAbort,
+            "explicit cleanup preserves pending and abort behavior");
+    if (!inputAbort) require(cleanupSawComplete, "terminal cleanup observes complete import and ReaderBase ownership");
+    expect(cleanupB.data(), savedB.data(), savedB.size(), "terminal cleanup receives restored B");
+    cleanupRenderer = nullptr;
+  }
+}
+
+static void testLegacySnapshots(HalDisplay& hal) {
+  GfxRenderer renderer(hal); renderer.begin(); renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  require(renderer.setUiGrayEnabled(true), "legacy guard enables retention");
+  renderer.clearScreen();
+  const uint8_t byte = 0xCC;
+  const auto before = physical;
+  renderer.writeFramebufferRegion(0, 0, 8, 1, &byte);
+  expect(physical.data(), before.data(), before.size(), "retained rejects legacy unsized write");
+  require(!renderer.copyBufferToRegion(0, 0, 8, 1, &byte, 1), "retained rejects legacy sized write");
+  uint8_t read = 0xA5;
+  require(renderer.readFramebufferRegion(0, 0, 8, 1, &read, 1) == 0 &&
+          !renderer.copyRegionToBuffer(0, 0, 8, 1, &read, 1) && read == 0xA5, "retained rejects legacy region capture");
+  require(!renderer.storeBwBuffer(), "retained rejects legacy BW save");
+  renderer.restoreBwBuffer();
+  expect(physical.data(), before.data(), before.size(), "retained rejects legacy BW restore");
+  require(renderer.setUiGrayEnabled(false), "legacy control disables retention");
+  for (bool inputAbort : {false, true}) {
+    renderer.beginDisplayWork(); renderer.clearScreen();
+    renderer.writeFramebufferRegion(0, 0, 8, 1, &byte);
+    require(physical[0] == 0xCC && renderer.readFramebufferRegion(0, 0, 8, 1, &read, 1) == 1 && read == 0xCC,
+            "disabled legacy unsized region roundtrip preserved");
+    const uint8_t other = 0x33;
+    require(renderer.copyBufferToRegion(8, 0, 8, 1, &other, 1) &&
+            renderer.copyRegionToBuffer(8, 0, 8, 1, &read, 1) && read == 0x33,
+            "disabled legacy sized region roundtrip preserved");
+    const auto saved = physical;
+    require(renderer.storeBwBuffer(), "disabled legacy saves B");
+    renderer.prepareGrayscaleTarget(); physical.fill(0x55);
+    if (inputAbort) renderer.abortDisplayWork();
+    const int callsBefore = cleanupCalls, commitsBefore = cleanupSubmissions;
+    renderer.restoreBwBuffer();
+    expect(physical.data(), saved.data(), saved.size(), "disabled legacy restores B including abort");
+    expect(cleanupB.data(), saved.data(), saved.size(), "legacy terminal cleanup receives restored B");
+    require(cleanupCalls == callsBefore + 1 && cleanupSubmissions == commitsBefore + !inputAbort,
+            "legacy cleanup still reached on normal and aborted restore");
+  }
+  renderer.beginDisplayWork(); renderer.clearScreen();
+  {
+    GfxRenderer::ScopedTarget owner(renderer, GfxRenderer::FrameOwner::ReaderScratch);
+    require(renderer.storeReaderBwScratch(), "disabled owned scratch save accepted");
+    physical.fill(0x33); renderer.restoreBwBuffer();
+    require(physical[0] == 0x33 && renderer.restoreReaderBwScratch() && physical[0] == 0xFF,
+            "disabled legacy wrapper cannot consume owned scratch save");
+  }
+}
+
 int main() {
   HalDisplay hal;
   {
@@ -1842,6 +2082,9 @@ int main() {
   testSnapshots(hal);
   testRegionSnapshots(hal);
   testFrameReplacement(hal);
+  testLegacySnapshots(hal);
+  testReaderScratchOwnership(hal);
+  testReaderScratchImport(hal);
   std::puts("PASS: actual renderer ownership, submission, imports, glyphs, opaque writers, image clipping and stale target controls");
   }
   require(liveAllocations == 0, "renderer destruction releases pair");
@@ -2086,7 +2329,8 @@ class RendererSeamTest(unittest.TestCase):
                 obj = work / f"source-{index}.o"
                 compiler = cc if source.suffix == ".c" else cxx
                 standard = "-std=c11" if source.suffix == ".c" else "-std=c++17"
-                subprocess.run([*compiler, standard, *common, "-c", str(source), "-o", str(obj)], check=True)
+                allocator = ["-Dmalloc=gfx_malloc"] if source == RENDERER else []
+                subprocess.run([*compiler, standard, *common, *allocator, "-c", str(source), "-o", str(obj)], check=True)
                 objects.append(str(obj))
             binary = work / "gfx-gray"
             dead_strip = "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections"
@@ -2166,6 +2410,20 @@ class RendererSeamTest(unittest.TestCase):
                 ("abort publication between planes", "memcpy(destinations[plane], sources[plane], bytes);",
                  "memcpy(destinations[plane], sources[plane], bytes); if (accountCancellation()) return FrameResult::PublishedCancelled;",
                  "replacement complete L: byte 0 expected 22, actual 11"),
+                ("unmatched scratch owner", "bwScratchOwner_ != target_.identity || bwScratchWork_ != workGeneration_",
+                 "bwScratchWork_ != workGeneration_", "unmatched scratch restore rejected: expected true, actual false"),
+                ("scratch selector loss", "if (uiGrayEnabled_) liveCoherent_ = false; if (readerImportCurrent()) {",
+                 "if (uiGrayEnabled_) { liveCoherent_ = false; memset(liveL_, 0, frameBufferSize); } if (readerImportCurrent()) {",
+                 "scratch restore preserves L and gray marker: byte 200 expected 50, actual 00"),
+                ("scratch premature validity", "if (uiGrayEnabled_) liveCoherent_ = false; if (readerImportCurrent()) {",
+                 "if (uiGrayEnabled_) liveCoherent_ = true; if (readerImportCurrent()) {",
+                 "scratch B restoration alone cannot certify tuple: expected true, actual false"),
+                ("scratch premature cleanup", "if (!restoreBwBufferChunks()) return false; if (uiGrayEnabled_)",
+                 "if (!restoreBwBufferChunks()) return false; cleanupGrayscaleWithFrameBuffer(); if (uiGrayEnabled_)",
+                 "CPU scratch restoration never calls cleanup: expected true, actual false"),
+                ("scratch write before validation", "if (!bwBufferStored_) return false; if (bwBufferChunks.size()",
+                 "if (!bwBufferStored_) return false; memcpy(frameBuffer, bwBufferChunks.front(), BW_BUFFER_CHUNK_SIZE); if (bwBufferChunks.size()",
+                 "missing final chunk rejects before any B write: byte 0 expected 33, actual CC"),
             ]
             for name, original, replacement, expected_error in mutants:
                 pattern = r"\s+".join(re.escape(part) for part in original.split())
@@ -2173,7 +2431,7 @@ class RendererSeamTest(unittest.TestCase):
                 self.assertEqual(len(matches), 1, f"{name} mutant anchor changed")
                 match = matches[0]
                 mutated.write_text(source[:match.start()] + replacement + source[match.end():])
-                subprocess.run([*cxx, "-std=c++17", *common, "-c", str(mutated), "-o", str(mutant_object)], check=True)
+                subprocess.run([*cxx, "-std=c++17", *common, "-Dmalloc=gfx_malloc", "-c", str(mutated), "-o", str(mutant_object)], check=True)
                 subprocess.run([*cxx, dead_strip, str(mutant_object), *objects[1:], "-o", str(mutant_binary)], check=True)
                 result = subprocess.run([str(mutant_binary)], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, f"{name} mutant survived")

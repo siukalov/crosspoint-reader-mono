@@ -149,6 +149,7 @@ bool GfxRenderer::setUiGrayEnabled(const bool enabled) {
   }
   if (enabled && (!liveL_ || !liveM_)) return false;
   if (uiGrayEnabled_ != enabled) {
+    freeBwBufferChunks();
     uiGrayEnabled_ = enabled;
     ++restoreEpoch_;
     liveCoherent_ = false;
@@ -222,6 +223,7 @@ GfxRenderer::ScopedTarget::ScopedTarget(const GfxRenderer& renderer, FrameOwner 
   renderer_.target_.coherentOnEntry = renderer_.liveCoherent_;
   if (owner == FrameOwner::ReaderScratch && renderer_.uiGrayEnabled_) renderer_.liveCoherent_ = false;
   renderer_.target_.identity = ++renderer_.targetGeneration_;
+  identity_ = renderer_.target_.identity;
   active_ = true;
 }
 
@@ -235,6 +237,7 @@ GfxRenderer::ScopedTarget::ScopedTarget(const GfxRenderer& renderer, uint8_t* pr
       previousStripBound_(renderer.stripBound_) {
   if (!renderer.frameBuffer || !primary || rows <= 0 || y0 < 0 || y0 > renderer.panelHeight - rows) return;
   renderer_.bindStrip(primary, secondary, y0, rows);
+  identity_ = renderer_.target_.identity;
   active_ = true;
 }
 
@@ -255,12 +258,14 @@ GfxRenderer::ScopedTarget::ScopedTarget(const GfxRenderer& renderer, GrayFrame t
   renderer_.target_.coverage = CoveragePolicy::Collect;
   renderer_.target_.tuple = tuple;
   renderer_.target_.coherent = &coherent;
+  identity_ = renderer_.target_.identity;
   active_ = true;
 }
 
 GfxRenderer::ScopedTarget::~ScopedTarget() {
   if (!active_) return;
   renderer_.accountCancellation();
+  if (renderer_.bwScratchOwner_ == identity_) renderer_.freeBwBufferChunks();
   renderer_.target_ = previous_;
   renderer_.renderMode = previousMode_;
   renderer_.stripSaved_ = previousStrip_;
@@ -278,6 +283,7 @@ void GfxRenderer::releaseFrameBufferForBuild() {
   uint32_t size = 0;
   uint8_t* scratch = display.lendFrameBufferStorage(&size);
   if (!scratch) return;
+  freeBwBufferChunks();
   frameBuffer = nullptr;
   target_.owner = FrameOwner::Loan;
   ++restoreEpoch_;
@@ -1897,6 +1903,7 @@ bool GfxRenderer::supportsAsyncRefresh() const { return !fadingFix && !hasUiGray
 void GfxRenderer::beginDisplayWork() const {
   accountCancellation();
   readerImport_.active = false;
+  freeBwBufferChunks();
   ++workGeneration_;
   display.beginDisplayWork();
   cancellationAccounted_ = false;
@@ -2030,6 +2037,7 @@ GfxRenderer::FrameResult GfxRenderer::replaceFrame(const FrameSnapshot& source) 
     memcpy(destinations[plane], sources[plane], bytes);
   }
   ++targetGeneration_;
+  freeBwBufferChunks();
   readerImport_ = {};
   if (accountCancellation()) return FrameResult::PublishedCancelled;
   ++restoreEpoch_;
@@ -2038,7 +2046,7 @@ GfxRenderer::FrameResult GfxRenderer::replaceFrame(const FrameSnapshot& source) 
 }
 
 size_t GfxRenderer::readFramebufferRegion(int x, int y, int w, int h, uint8_t* dst, size_t dstCapacity) const {
-  if (!canCaptureLiveFrame() || dst == nullptr || w <= 0 || h <= 0) return 0;
+  if (uiGrayEnabled_ || !canCaptureLiveFrame() || dst == nullptr || w <= 0 || h <= 0) return 0;
 
   const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x, y, w, h, panelWidth, panelHeight);
   if (!mem.valid) return 0;
@@ -2056,7 +2064,7 @@ size_t GfxRenderer::readFramebufferRegion(int x, int y, int w, int h, uint8_t* d
 }
 
 void GfxRenderer::writeFramebufferRegion(int x, int y, int w, int h, const uint8_t* src) {
-  if (!canCaptureLiveFrame() || src == nullptr || w <= 0 || h <= 0) return;
+  if (uiGrayEnabled_ || !canCaptureLiveFrame() || src == nullptr || w <= 0 || h <= 0) return;
 
   const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x, y, w, h, panelWidth, panelHeight);
   if (!mem.valid) return;
@@ -2239,6 +2247,7 @@ size_t GfxRenderer::getRegionByteSize(int lx, int ly, int lw, int lh) const {
 }
 
 bool GfxRenderer::copyRegionToBuffer(int lx, int ly, int lw, int lh, uint8_t* buf, size_t bufSize) const {
+  if (uiGrayEnabled_) return false;
   int x0, y0, x1, y1;
   if (!logicalRectToPhysicalBounds(orientation, lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
     return false;
@@ -2257,6 +2266,7 @@ bool GfxRenderer::copyRegionToBuffer(int lx, int ly, int lw, int lh, uint8_t* bu
 }
 
 bool GfxRenderer::copyBufferToRegion(int lx, int ly, int lw, int lh, const uint8_t* buf, size_t bufSize) const {
+  if (uiGrayEnabled_) return false;
   int x0, y0, x1, y1;
   if (!logicalRectToPhysicalBounds(orientation, lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
     return false;
@@ -2638,66 +2648,76 @@ void GfxRenderer::prepareGrayscaleTarget() const {
 
 bool GfxRenderer::supportsStripGrayscale() const { return display.supportsStripGrayscale(); }
 
-void GfxRenderer::freeBwBufferChunks() {
-  for (auto& bwBufferChunk : bwBufferChunks) {
-    if (bwBufferChunk) {
-      free(bwBufferChunk);
-      bwBufferChunk = nullptr;
-    }
+void GfxRenderer::freeBwBufferChunks() const {
+  for (auto& chunk : bwBufferChunks) {
+    free(chunk);
+    chunk = nullptr;
   }
+  bwBufferStored_ = false;
+  bwScratchOwner_ = 0;
+  bwScratchWork_ = 0;
 }
 
-bool GfxRenderer::storeBwBuffer() {
-  if (!canCaptureLiveFrame()) return false;
-  for (size_t i = 0; i < bwBufferChunks.size(); i++) {
-    if (bwBufferChunks[i]) {
-      LOG_ERR("GFX", "!! BW buffer chunk %zu already stored - this is likely a bug, freeing chunk", i);
-      free(bwBufferChunks[i]);
-      bwBufferChunks[i] = nullptr;
-    }
-
+bool GfxRenderer::storeBwBufferChunks() const {
+  if (bwBufferStored_ || bwBufferChunks.empty()) return false;
+  for (size_t i = 0; i < bwBufferChunks.size(); ++i) {
     const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
     const size_t chunkSize = std::min(BW_BUFFER_CHUNK_SIZE, static_cast<size_t>(frameBufferSize - offset));
     bwBufferChunks[i] = static_cast<uint8_t*>(malloc(chunkSize));
-
     if (!bwBufferChunks[i]) {
-      LOG_ERR("GFX", "!! Failed to allocate BW buffer chunk %zu (%zu bytes)", i, chunkSize);
+      LOG_ERR("GFX", "Failed to allocate BW buffer chunk %zu (%zu bytes)", i, chunkSize);
       freeBwBufferChunks();
       return false;
     }
-
     memcpy(bwBufferChunks[i], frameBuffer + offset, chunkSize);
   }
-
-  LOG_DBG("GFX", "Stored BW buffer in %zu chunks (%zu bytes each)", bwBufferChunks.size(), BW_BUFFER_CHUNK_SIZE);
+  bwBufferStored_ = true;
   return true;
 }
 
-void GfxRenderer::restoreBwBuffer() {
-  if (!frameBuffer || target_.strip) return;
-  bool missingChunks = false;
-  for (const auto& bwBufferChunk : bwBufferChunks) {
-    if (!bwBufferChunk) {
-      missingChunks = true;
-      break;
-    }
-  }
-
-  if (missingChunks) {
+bool GfxRenderer::restoreBwBufferChunks() const {
+  if (!bwBufferStored_) return false;
+  if (bwBufferChunks.size() != (frameBufferSize + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE ||
+      std::any_of(bwBufferChunks.begin(), bwBufferChunks.end(), [](const uint8_t* chunk) { return !chunk; })) {
     freeBwBufferChunks();
-    return;
+    return false;
   }
-
-  for (size_t i = 0; i < bwBufferChunks.size(); i++) {
+  for (size_t i = 0; i < bwBufferChunks.size(); ++i) {
     const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
     const size_t chunkSize = std::min(BW_BUFFER_CHUNK_SIZE, static_cast<size_t>(frameBufferSize - offset));
     memcpy(frameBuffer + offset, bwBufferChunks[i], chunkSize);
   }
-
-  display.cleanupGrayscaleBuffers(frameBuffer);
-
   freeBwBufferChunks();
-  LOG_DBG("GFX", "Restored and freed BW buffer chunks");
+  return true;
+}
+
+bool GfxRenderer::storeReaderBwScratch() {
+  if (!frameBuffer || target_.strip || target_.owner != FrameOwner::ReaderScratch || accountCancellation())
+    return false;
+  if (!storeBwBufferChunks()) return false;
+  bwScratchOwner_ = target_.identity;
+  bwScratchWork_ = workGeneration_;
+  return true;
+}
+
+bool GfxRenderer::restoreReaderBwScratch() {
+  if (!frameBuffer || target_.strip || target_.owner != FrameOwner::ReaderScratch ||
+      bwScratchOwner_ != target_.identity || bwScratchWork_ != workGeneration_)
+    return false;
+  accountCancellation();
+  if (!restoreBwBufferChunks()) return false;
+  if (uiGrayEnabled_) liveCoherent_ = false;
+  if (readerImportCurrent()) {
+    for (int y = readerImport_.y0; y < readerImport_.y1; ++y) readerImport_.coverage[y] |= 1;
+  }
+  return true;
+}
+
+bool GfxRenderer::storeBwBuffer() { return !uiGrayEnabled_ && canCaptureLiveFrame() && storeBwBufferChunks(); }
+
+void GfxRenderer::restoreBwBuffer() {
+  if (uiGrayEnabled_ || !frameBuffer || target_.strip || bwScratchOwner_ != 0) return;
+  if (restoreBwBufferChunks()) cleanupGrayscaleWithFrameBuffer();
 }
 
 void GfxRenderer::cleanupGrayscaleWithFrameBuffer() const {

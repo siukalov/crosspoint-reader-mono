@@ -72,7 +72,10 @@ class GfxRenderer {
   uint16_t panelHeight = HalDisplay::DISPLAY_HEIGHT;
   uint16_t panelWidthBytes = HalDisplay::DISPLAY_WIDTH_BYTES;
   uint32_t frameBufferSize = HalDisplay::BUFFER_SIZE;
-  std::vector<uint8_t*> bwBufferChunks;
+  mutable std::vector<uint8_t*> bwBufferChunks;
+  mutable bool bwBufferStored_ = false;
+  mutable uint32_t bwScratchOwner_ = 0;
+  mutable uint32_t bwScratchWork_ = 0;
   std::map<int, EpdFontFamily> fontMap;
   mutable std::map<int, SdCardFont*> sdCardFonts_;
   mutable std::map<int, uint16_t> sdCardFontScales_;  // fontId -> 8.8 fixed point scale (256=1.0x)
@@ -146,7 +149,9 @@ class GfxRenderer {
 
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, int* y, bool pixelState,
                   EpdFontFamily::Style style) const;
-  void freeBwBufferChunks();
+  void freeBwBufferChunks() const;
+  bool storeBwBufferChunks() const;
+  bool restoreBwBufferChunks() const;
   template <Color color>
   void drawPixelDither(int x, int y) const;
   template <Color color>
@@ -200,6 +205,7 @@ class GfxRenderer {
     TargetBinding previousStrip_;
     RenderMode previousStripMode_;
     bool previousStripBound_;
+    uint32_t identity_ = 0;
     bool active_ = false;
   };
 
@@ -248,6 +254,7 @@ class GfxRenderer {
 
   void setOrientation(const Orientation o) {
     if (orientation == o) return;
+    freeBwBufferChunks();
     orientation = o;
     ++restoreEpoch_;
   }
@@ -362,8 +369,10 @@ class GfxRenderer {
   bool supportsBusyGrayscaleStaging() const;
   void prepareGrayscaleTarget() const;
   bool supportsStripGrayscale() const;
-  bool storeBwBuffer();    // Returns true if buffer was stored successfully
-  void restoreBwBuffer();  // Restore and free the stored buffer
+  bool storeReaderBwScratch();
+  bool restoreReaderBwScratch();
+  bool storeBwBuffer();
+  void restoreBwBuffer();
   void cleanupGrayscaleWithFrameBuffer() const;
 
   const uint8_t* getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const;
