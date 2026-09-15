@@ -332,6 +332,24 @@ static void sendCaptureChunk(const char* command) {
   usbTransport.sendLine(response);
 }
 
+static void sendTransitionMetadata() {
+  const auto& meta = PanelDiagnostic::transitionMetadata();
+  char response[256];
+  snprintf(response, sizeof(response), "GRAYTRANS META %u %s %u %u %u %u %u %u %u %u", meta.generation,
+           meta.changed ? "BWCHANGED" : "BW", meta.renderMs, meta.activationCount, meta.committed, meta.completed,
+           meta.noActivation, meta.captureError, meta.overflow, meta.valid);
+  usbTransport.sendLine(response);
+  for (uint32_t i = 0; i < meta.activationCount && i < PanelDiagnostic::MAX_ACTIVATIONS; ++i) {
+    const auto& activation = meta.activations[i];
+    snprintf(response, sizeof(response), "GRAYTRANS ACT %u %u %02X %u %u %08X %u %08X %u %u %u", meta.generation, i,
+             activation.control, activation.driverGeneration, activation.bytes24, activation.crc24, activation.bytes26,
+             activation.crc26, activation.busyMs, activation.completionSeen, activation.completed);
+    usbTransport.sendLine(response);
+  }
+  snprintf(response, sizeof(response), "GRAYTRANS END %u", meta.generation);
+  usbTransport.sendLine(response);
+}
+
 static bool dispatchUsbCommand(const std::string& line) {
   const bool protocol = line == "CP1" || line.compare(0, 4, "CP1 ") == 0;
   const bool diagnostic = line.compare(0, 12, "CMD:GRAYTEST") == 0 || line.compare(0, 11, "CMD:GRAYCAP") == 0;
@@ -358,6 +376,13 @@ static bool dispatchUsbCommand(const std::string& line) {
       sendCaptureMetadata();
     else
       usbTransport.sendLine("GRAYTEST ERROR CAPTURE");
+  } else if (line == "CMD:GRAYTEST BW" || line == "CMD:GRAYTEST BWCHANGED") {
+    if (!diagnosticActive) {
+      usbTransport.sendLine("GRAYTRANS ERROR NO_GRAY");
+    } else {
+      PanelDiagnostic::renderBwFixture(line == "CMD:GRAYTEST BWCHANGED");
+      sendTransitionMetadata();
+    }
   } else if (line == "CMD:GRAYCAP") {
     sendCaptureMetadata();
   } else if (line.compare(0, 12, "CMD:GRAYCAP ") == 0) {

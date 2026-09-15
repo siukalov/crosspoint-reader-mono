@@ -42,6 +42,12 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME panel_diagnostic
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/panel_diagnostic_test.py
 )
+add_test(NAME panel_transition
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/panel_transition_test.py
+)
+add_test(NAME panel_cli_cleanup
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/panel_cli_cleanup_test.py
+)
 add_test(NAME sdk_patch_hook
   COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_CURRENT_SOURCE_DIR}/sdk_patch_hook -p "test_*.py"
@@ -52,7 +58,7 @@ add_test(NAME usb_file_transfer
 add_test(NAME usb_serial_transport
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/usb_serial_transport/run.sh
 )
-set_tests_properties(panel_diagnostic usb_file_transfer usb_serial_transport PROPERTIES
+set_tests_properties(panel_diagnostic panel_transition usb_file_transfer usb_serial_transport PROPERTIES
   ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
 )
 
