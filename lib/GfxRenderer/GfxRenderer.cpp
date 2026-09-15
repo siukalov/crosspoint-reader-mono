@@ -169,6 +169,8 @@ void GfxRenderer::invalidateTarget() const {
   } else if (target_.owner == FrameOwner::LiveUi || target_.owner == FrameOwner::ReaderBase ||
              target_.owner == FrameOwner::ReaderScratch) {
     liveCoherent_ = false;
+    readerImport_.active = false;
+    target_.coherentOnEntry = false;
   }
 }
 
@@ -206,8 +208,9 @@ GfxRenderer::ScopedTarget::ScopedTarget(const GfxRenderer& renderer, FrameOwner 
   renderer_.target_ = {};
   renderer_.target_.owner = owner;
   renderer_.target_.coverage = owner == FrameOwner::LiveUi ? CoveragePolicy::Collect : CoveragePolicy::Suspend;
-  if (owner == FrameOwner::ReaderScratch) renderer_.liveCoherent_ = false;
-  ++renderer_.targetGeneration_;
+  renderer_.target_.coherentOnEntry = renderer_.liveCoherent_;
+  if (owner == FrameOwner::ReaderScratch && renderer_.uiGrayEnabled_) renderer_.liveCoherent_ = false;
+  renderer_.target_.identity = ++renderer_.targetGeneration_;
   active_ = true;
 }
 
@@ -1616,6 +1619,14 @@ void GfxRenderer::clearScreen(const uint8_t color) const {
     if (target_.secondary) memset(target_.secondary, color, static_cast<size_t>(panelWidthBytes) * target_.rows);
     return;
   }
+  if (readerImportCurrent()) {
+    liveCoherent_ = false;
+    for (int y = readerImport_.y0; y < readerImport_.y1; ++y) {
+      GrayFrame::copyPlaneRow(frameBuffer + y * panelWidthBytes, nullptr, readerImport_.x0, readerImport_.x1, color);
+      readerImport_.coverage[y] &= ~1;
+    }
+    return;
+  }
   display.clearScreen(color);
   if (target_.owner == FrameOwner::LiveUi) liveCoherent_ = !display.postRefreshAborted();
 }
@@ -1629,12 +1640,12 @@ void GfxRenderer::bindStrip(uint8_t* primary, uint8_t* secondary, int y0, int ro
   target_.owner = secondary ? FrameOwner::OffscreenSelector : FrameOwner::OffscreenBw;
   if (primary == frameBuffer || secondary == frameBuffer) {
     target_.owner = FrameOwner::ReaderScratch;
-    liveCoherent_ = false;
+    if (uiGrayEnabled_) liveCoherent_ = false;
   }
   target_.coverage = CoveragePolicy::Suspend;
   target_.tuple = {};
   target_.coherent = nullptr;
-  ++targetGeneration_;
+  target_.identity = ++targetGeneration_;
 }
 
 void GfxRenderer::beginStripTarget(uint8_t* scratch, int stripY0, int stripRows) const {
@@ -1699,11 +1710,12 @@ void GfxRenderer::displayBuffer(const HalDisplay::RefreshMode refreshMode) const
   if (!canSubmit()) return;
   auto elapsed = millis() - start_ms;
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
-  display.displayBuffer(refreshMode, fadingFix);
+  if (!submitUiGray(refreshMode)) display.displayBuffer(refreshMode, fadingFix);
 }
 
 void GfxRenderer::displayBufferAsync(const HalDisplay::RefreshMode refreshMode) const {
   if (!canSubmit()) return;
+  if (submitUiGray(refreshMode)) return;
   if (fadingFix) {
     display.displayBuffer(refreshMode, fadingFix);
     return;
@@ -1715,10 +1727,27 @@ bool GfxRenderer::refreshBusy() const { return display.refreshBusy(); }
 
 void GfxRenderer::waitRefreshComplete() const { display.waitRefreshComplete(); }
 
-bool GfxRenderer::supportsAsyncRefresh() const { return !fadingFix && display.supportsAsyncRefresh(); }
+bool GfxRenderer::hasUiGray() const {
+  return uiGrayEnabled_ && target_.owner == FrameOwner::LiveUi &&
+         std::any_of(liveM_, liveM_ + frameBufferSize, [](uint8_t value) { return value != 0; });
+}
+
+bool GfxRenderer::submitUiGray(HalDisplay::RefreshMode refreshMode) const {
+  if (!hasUiGray()) return false;
+  display.displayGrayscaleBase(refreshMode, fadingFix);
+  if (accountCancellation()) return true;
+  display.copyGrayscaleLsbBuffers(liveL_);
+  display.copyGrayscaleMsbBuffers(liveM_);
+  if (!accountCancellation()) display.displayGrayBuffer(fadingFix);
+  return true;
+}
+
+bool GfxRenderer::supportsAsyncRefresh() const { return !fadingFix && !hasUiGray() && display.supportsAsyncRefresh(); }
 
 void GfxRenderer::beginDisplayWork() const {
   accountCancellation();
+  readerImport_.active = false;
+  ++workGeneration_;
   display.beginDisplayWork();
   cancellationAccounted_ = false;
 }
@@ -2219,16 +2248,97 @@ void GfxRenderer::preconditionGrayscale(int x, int y, int w, int h) const {
                                 static_cast<uint16_t>(x1 - x0 + 1), static_cast<uint16_t>(y1 - y0 + 1));
 }
 
+bool GfxRenderer::readerImportCurrent() const {
+  return readerImport_.active && frameBuffer && target_.owner == FrameOwner::ReaderScratch && !target_.strip &&
+         readerImport_.target == target_.identity && readerImport_.work == workGeneration_ &&
+         readerImport_.orientation == orientation && !accountCancellation();
+}
+
+bool GfxRenderer::beginReaderImport(int x, int y, int width, int height) const {
+  if (!uiGrayEnabled_ || !frameBuffer || target_.strip || target_.owner != FrameOwner::ReaderScratch ||
+      !target_.coherentOnEntry || accountCancellation())
+    return false;
+  setGrayscaleClipRect(x, y, width, height);
+  if (!target_.clip) return false;
+  int x0, y0, x1, y1;
+  if (!logicalRectToPhysicalBounds(orientation, target_.x0, target_.clipY0, target_.x1 - target_.x0,
+                                   target_.y1 - target_.clipY0, panelWidth, panelHeight, &x0, &y0, &x1, &y1))
+    return false;
+  readerImport_ = {};
+  readerImport_.active = true;
+  readerImport_.target = target_.identity;
+  readerImport_.work = workGeneration_;
+  readerImport_.orientation = orientation;
+  readerImport_.x0 = x0;
+  readerImport_.x1 = x1 + 1;
+  readerImport_.y0 = y0;
+  readerImport_.y1 = y1 + 1;
+  target_.coherentOnEntry = false;
+  return true;
+}
+
+bool GfxRenderer::replaceReaderRows(uint8_t* destination, uint8_t coverage, const uint8_t* source, size_t capacity,
+                                    int yStart, int rows) const {
+  if (!readerImportCurrent() || !source || yStart < 0 || rows <= 0 || yStart > panelHeight - rows ||
+      static_cast<size_t>(rows) > capacity / panelWidthBytes)
+    return false;
+  const int first = std::max(yStart, readerImport_.y0);
+  const int last = std::min(yStart + rows, readerImport_.y1);
+  if (first >= last) return false;
+  liveCoherent_ = false;
+  for (int y = first; y < last; ++y) {
+    GrayFrame::copyPlaneRow(destination + y * panelWidthBytes, source + (y - yStart) * panelWidthBytes,
+                            readerImport_.x0, readerImport_.x1);
+    readerImport_.coverage[y] |= coverage;
+  }
+  return true;
+}
+
+bool GfxRenderer::importReaderPlane(bool lsb, const uint8_t* source, size_t capacity, int yStart, int rows) const {
+  uint8_t* destination = lsb ? liveL_ : liveM_;
+  if (!replaceReaderRows(destination, lsb ? 2 : 4, source, capacity, yStart, rows)) return false;
+  const int first = std::max(yStart, readerImport_.y0);
+  const int last = std::min(yStart + rows, readerImport_.y1);
+  display.writeGrayscalePlaneStrip(lsb, destination + first * panelWidthBytes, first, last - first);
+  return true;
+}
+
+bool GfxRenderer::restoreReaderBase(const uint8_t* source, size_t capacity, int yStart, int rows) const {
+  return replaceReaderRows(frameBuffer, 1, source, capacity, yStart, rows);
+}
+
+bool GfxRenderer::finishReaderImport() const {
+  if (!readerImportCurrent()) return false;
+  for (int y = readerImport_.y0; y < readerImport_.y1; ++y) {
+    if (readerImport_.coverage[y] != 7) return false;
+  }
+  liveCoherent_ = true;
+  return true;
+}
+
 void GfxRenderer::copyGrayscaleLsbBuffers() const {
+  if (uiGrayEnabled_) {
+    importReaderPlane(true, frameBuffer, frameBufferSize, 0, panelHeight);
+    return;
+  }
   if (frameBuffer && !target_.strip) display.copyGrayscaleLsbBuffers(frameBuffer);
 }
 
 void GfxRenderer::copyGrayscaleMsbBuffers() const {
+  if (uiGrayEnabled_) {
+    importReaderPlane(false, frameBuffer, frameBufferSize, 0, panelHeight);
+    return;
+  }
   if (frameBuffer && !target_.strip) display.copyGrayscaleMsbBuffers(frameBuffer);
 }
 
 void GfxRenderer::displayGrayBuffer() const {
-  if (canSubmit()) display.displayGrayBuffer(fadingFix);
+  if (!canSubmit()) return;
+  if (uiGrayEnabled_) {
+    display.copyGrayscaleLsbBuffers(liveL_);
+    display.copyGrayscaleMsbBuffers(liveM_);
+  }
+  if (!accountCancellation()) display.displayGrayBuffer(fadingFix);
 }
 
 void GfxRenderer::displayGrayCalibration(const int customX, const int customY, const int customW,
@@ -2241,6 +2351,11 @@ void GfxRenderer::displayGrayCalibration(const int customX, const int customY, c
 
 void GfxRenderer::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* scratch, int yStart, int numRows) const {
   if (!frameBuffer) return;
+  if (uiGrayEnabled_) {
+    importReaderPlane(lsbPlane, scratch, numRows > 0 ? static_cast<size_t>(numRows) * panelWidthBytes : 0, yStart,
+                      numRows);
+    return;
+  }
   assert(yStart >= 0 && numRows > 0 && yStart <= static_cast<int>(panelHeight) - numRows);
   display.writeGrayscalePlaneStrip(lsbPlane, scratch, static_cast<uint16_t>(yStart), static_cast<uint16_t>(numRows));
 }

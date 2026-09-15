@@ -10,6 +10,7 @@ enum class BidiBaseDir : signed char { AUTO = -1, LTR = 0, RTL = 1 };
 class FontCacheManager;
 class SdCardFont;
 
+#include <array>
 #include <cstring>
 #include <map>
 #include <string>
@@ -68,6 +69,8 @@ class GfxRenderer {
     CoveragePolicy coverage = CoveragePolicy::Collect;
     GrayFrame tuple;
     bool* coherent = nullptr;
+    uint32_t identity = 0;
+    bool coherentOnEntry = false;
   };
   mutable TargetBinding target_;
   mutable TargetBinding stripSaved_;
@@ -80,6 +83,25 @@ class GfxRenderer {
   bool allocationAttempted_ = false;
   mutable bool liveCoherent_ = true;
   mutable bool cancellationAccounted_ = false;
+  mutable uint32_t workGeneration_ = 0;
+  struct ReaderImport {
+    bool active = false;
+    uint32_t target = 0;
+    uint32_t work = 0;
+    Orientation orientation = Portrait;
+    int x0 = 0;
+    int x1 = 0;
+    int y0 = 0;
+    int y1 = 0;
+    std::array<uint8_t, HalDisplay::DISPLAY_HEIGHT> coverage{};
+  };
+  mutable ReaderImport readerImport_;
+
+  bool readerImportCurrent() const;
+  bool replaceReaderRows(uint8_t* destination, uint8_t coverage, const uint8_t* source, size_t capacity, int yStart,
+                         int rows) const;
+  bool hasUiGray() const;
+  bool submitUiGray(HalDisplay::RefreshMode refreshMode) const;
 
   GrayFrame activeTuple() const;
   bool accountCancellation() const;
@@ -287,6 +309,10 @@ class GfxRenderer {
   void preconditionGrayscale() const;
   void preconditionGrayscale(int x, int y, int w, int h) const;
   void displayGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
+  bool beginReaderImport(int x, int y, int width, int height) const;
+  bool importReaderPlane(bool lsb, const uint8_t* source, size_t capacity, int yStart, int rows) const;
+  bool restoreReaderBase(const uint8_t* source, size_t capacity, int yStart, int rows) const;
+  bool finishReaderImport() const;
   void copyGrayscaleLsbBuffers() const;
   void copyGrayscaleMsbBuffers() const;
   void displayGrayBuffer() const;

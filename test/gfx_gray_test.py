@@ -2,6 +2,7 @@
 """Compile the production renderer and font stack against host hardware boundaries."""
 
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -101,6 +102,12 @@ static std::array<uint8_t, 48000> physical;
 static bool lent = false;
 static bool aborted = false;
 static int submissions = 0;
+static int graySubmissions = 0;
+static int baseSubmissions = 0;
+static int asyncSubmissions = 0;
+static HalDisplay::RefreshMode lastFallback = HalDisplay::FAST_REFRESH;
+static bool lastFadingFix = false;
+static std::array<uint8_t, 48000> stagedB{}, stagedL{}, stagedM{};
 static void require(bool condition, const char* name) {
   if (!condition) {
     std::fprintf(stderr, "%s: expected true, actual false\n", name);
@@ -116,7 +123,19 @@ uint16_t HalDisplay::getDisplayWidthBytes() const { return 100; }
 uint32_t HalDisplay::getBufferSize() const { return 48000; }
 void HalDisplay::clearScreen(uint8_t color) const { physical.fill(color); }
 void HalDisplay::displayBuffer(RefreshMode, bool) { ++submissions; }
-void HalDisplay::displayBufferAsync(RefreshMode) { ++submissions; }
+void HalDisplay::displayBufferAsync(RefreshMode) { ++submissions; ++asyncSubmissions; }
+void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool fading) {
+  ++baseSubmissions; stagedB = physical; lastFallback = fallback; lastFadingFix = fading;
+}
+void HalDisplay::copyGrayscaleLsbBuffers(const uint8_t* source) { std::memcpy(stagedL.data(), source, 48000); }
+void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* source) { std::memcpy(stagedM.data(), source, 48000); }
+void HalDisplay::writeGrayscalePlaneStrip(bool lsb, const uint8_t* source, uint16_t y, uint16_t rows) {
+  std::memcpy((lsb ? stagedL : stagedM).data() + y * 100, source, rows * 100);
+}
+void HalDisplay::displayGrayBuffer(bool fading) { ++graySubmissions; lastFadingFix = fading; }
+bool HalDisplay::supportsAsyncRefresh() const { return true; }
+bool HalDisplay::refreshBusy() { return false; }
+void HalDisplay::waitRefreshComplete() {}
 void HalDisplay::beginDisplayWork() { aborted = false; }
 void HalDisplay::abortPostRefresh() { aborted = true; }
 bool HalDisplay::postRefreshAborted() const { return aborted; }
@@ -346,6 +365,171 @@ static void testOwnership(HalDisplay& hal, GfxRenderer& renderer) {
   require(renderer.setUiGrayEnabled(true) && allocationCalls == 2 && liveAllocations == 2, "policy toggle reuses pair");
 }
 
+static void testUiSubmission(GfxRenderer& renderer) {
+  renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  renderer.clearScreen();
+  require(renderer.drawCoverage(1, 2, 2), "seed live UI marker for submission");
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  require(graySubmissions == 1, "UI marker submits exactly one gray frame");
+  require(baseSubmissions == 1 && lastFallback == HalDisplay::HALF_REFRESH, "UI gray uses requested base fallback");
+  require(stagedB[200] == 0xBF && stagedL[200] == 0x40 && stagedM[200] == 0x40,
+          "UI gray submits literal complete marker tuple");
+  require(!renderer.supportsAsyncRefresh(), "UI gray reports blocking refresh support");
+  renderer.setFadingFix(true);
+  renderer.displayBufferAsync(HalDisplay::FULL_REFRESH);
+  require(graySubmissions == 2 && baseSubmissions == 2 && asyncSubmissions == 0 && lastFadingFix &&
+          lastFallback == HalDisplay::FULL_REFRESH && !renderer.refreshBusy(), "async UI gray completes blocking with fading fix");
+  renderer.setFadingFix(false);
+  renderer.clearScreen();
+  const int binaryBefore = submissions;
+  renderer.displayBufferAsync();
+  require(submissions == binaryBefore + 1 && graySubmissions == 2 && renderer.supportsAsyncRefresh(),
+          "empty selectors retain binary async submission");
+}
+
+static void testReaderImport(GfxRenderer& renderer) {
+  using Owner = GfxRenderer::FrameOwner;
+  renderer.beginDisplayWork();
+  renderer.clearScreen();
+  require(renderer.drawCoverage(1, 2, 2) && renderer.drawCoverage(6, 2, 1) && renderer.drawCoverage(2, 2, 2),
+          "seed UI boundary markers and stale reader gray");
+  const uint8_t* liveL = renderer.getLiveGrayPlane(true);
+  const uint8_t* liveM = renderer.getLiveGrayPlane(false);
+  std::array<uint8_t, 200> sourceB{}, sourceL{}, sourceM{};
+  sourceB[0] = 0x0C;
+  sourceB[100] = 0x3C;
+  sourceL[0] = 0x10;
+  sourceM[0] = 0x18;
+  const int grayBefore = graySubmissions;
+  const int baseBefore = baseSubmissions;
+  {
+    GfxRenderer::ScopedTarget scratch(renderer, Owner::ReaderScratch);
+    require(renderer.beginReaderImport(2, 2, 4, 2), "begin clipped reader import");
+    renderer.clearScreen(0);
+    require(physical[200] == 0x83 && physical[0] == 0xFF, "scratch clear preserves B outside content clip");
+    require(liveL[200] == 0x60 && liveM[200] == 0x62, "scratch before mode change preserves UI and reader selectors");
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+    require(!renderer.finishReaderImport(), "incomplete selector coverage rejects completion");
+    renderer.displayBuffer();
+    require(graySubmissions == grayBefore, "incomplete reader import cannot submit");
+    require(!renderer.importReaderPlane(true, sourceL.data(), 99, 2, 1), "short selector source rejected");
+    require(renderer.importReaderPlane(true, sourceL.data(), 100, 2, 1), "replace first L strip");
+    require(stagedL[200] == 0x50, "import forwards whole L row with UI marker");
+    {
+      std::array<uint8_t, 100> nestedL{}, nestedM{};
+      GfxRenderer::ScopedTarget strip(renderer, nestedL.data(), 3, 1, nestedM.data());
+      renderer.clearScreen(0);
+      require(!renderer.importReaderPlane(false, sourceM.data(), 100, 2, 1), "different target cannot import reader plane");
+      require(!renderer.finishReaderImport(), "different target cannot finish reader import");
+    }
+    require(renderer.importReaderPlane(true, sourceL.data() + 100, 100, 3, 1), "L coverage survives nested strip binding");
+    renderer.writeGrayscalePlaneStrip(false, sourceM.data(), 2, 2);
+    require(!renderer.finishReaderImport(), "complete selectors without B restoration rejected");
+    require(renderer.restoreReaderBase(sourceB.data(), 100, 2, 1), "restore first B strip");
+    require(!renderer.finishReaderImport(), "partial B restoration rejected");
+    require(renderer.restoreReaderBase(sourceB.data() + 100, 100, 3, 1), "restore final B strip");
+    require(renderer.finishReaderImport(), "complete B L M reader import accepted");
+    renderer.clearScreen(0);
+    require(renderer.liveFrameNeedsRedraw() && !renderer.finishReaderImport(), "cleared completed import requires B restoration");
+    require(physical[200] == 0x83 && physical[0] == 0xFF, "repeated scratch clear preserves outside B marker");
+    require(renderer.restoreReaderBase(sourceB.data(), 200, 2, 2) && renderer.finishReaderImport(),
+            "B restoration completes cleared reader import again");
+  }
+  require(renderer.liveFrameValid(), "completed reader tuple readable after scratch exit");
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  require(graySubmissions == grayBefore + 1 && baseSubmissions == baseBefore + 1,
+          "reader scratch sequence submits exactly one complete gray frame");
+  std::array<uint8_t, 48000> expectedB, expectedL{}, expectedM{};
+  expectedB.fill(0xFF);
+  expectedB[200] = 0x8F;
+  expectedL[200] = 0x50;
+  expectedM[200] = 0x5A;
+  expect(stagedB.data(), expectedB.data(), 48000, "reader submitted B");
+  expect(stagedL.data(), expectedL.data(), 48000, "reader submitted L");
+  expect(stagedM.data(), expectedM.data(), 48000, "reader submitted M");
+
+  for (int abortPoint = 0; abortPoint < 5; ++abortPoint) {
+    renderer.beginDisplayWork();
+    renderer.clearScreen();
+    const int before = graySubmissions;
+    {
+      GfxRenderer::ScopedTarget scratch(renderer, Owner::ReaderScratch);
+      require(renderer.beginReaderImport(2, 2, 4, 2), "begin abort fixture");
+      renderer.clearScreen(0);
+      if (abortPoint == 0) renderer.abortDisplayWork();
+      renderer.importReaderPlane(true, sourceL.data(), 200, 2, 2);
+      if (abortPoint == 1) renderer.abortDisplayWork();
+      renderer.importReaderPlane(false, sourceM.data(), 200, 2, 2);
+      if (abortPoint == 2) renderer.abortDisplayWork();
+      renderer.restoreReaderBase(sourceB.data(), 200, 2, 2);
+      if (abortPoint == 3) renderer.abortDisplayWork();
+      if (abortPoint == 4) scratch.cancel();
+      require(!renderer.finishReaderImport(), "cancelled reader import rejected");
+    }
+    renderer.displayBuffer();
+    renderer.displayGrayBuffer();
+    require(graySubmissions == before && renderer.liveFrameNeedsRedraw(), "cancelled tuple makes no gray submission");
+  }
+  renderer.beginDisplayWork();
+  renderer.clearScreen();
+  {
+    GfxRenderer::ScopedTarget scratch(renderer, Owner::ReaderScratch);
+    require(renderer.beginReaderImport(2, 2, 4, 2), "begin generation fixture");
+    require(renderer.importReaderPlane(true, sourceL.data(), 200, 2, 2), "old work L imported");
+    require(renderer.restoreReaderBase(sourceB.data(), 200, 2, 2), "old work B restored");
+    renderer.beginDisplayWork();
+    require(!renderer.importReaderPlane(false, sourceM.data(), 200, 2, 2) && !renderer.finishReaderImport(),
+            "new work rejects old coverage");
+  }
+  const std::array<GfxRenderer::Orientation, 4> orientations = {
+      GfxRenderer::LandscapeCounterClockwise, GfxRenderer::LandscapeClockwise,
+      GfxRenderer::Portrait, GfxRenderer::PortraitInverted};
+  const std::array<int, 4> markerOffsets = {300, 47699, 47800, 199};
+  const std::array<uint8_t, 4> markerBits = {0x40, 0x02, 0x10, 0x08};
+  for (size_t index = 0; index < orientations.size(); ++index) {
+    renderer.beginDisplayWork();
+    renderer.setOrientation(orientations[index]);
+    renderer.clearScreen();
+    require(renderer.drawCoverage(1, 3, 2), "seed rotated marker");
+    std::array<uint8_t, 48000> white;
+    white.fill(0xFF);
+    {
+      GfxRenderer::ScopedTarget scratch(renderer, Owner::ReaderScratch);
+      require(renderer.beginReaderImport(2, 3, 4, 2), "begin rotated reader import");
+      renderer.clearScreen(0);
+      renderer.copyGrayscaleLsbBuffers();
+      renderer.copyGrayscaleMsbBuffers();
+      require(renderer.restoreReaderBase(white.data(), white.size(), 0, 480) && renderer.finishReaderImport(),
+              "full reader imports complete in every orientation");
+    }
+    renderer.displayBuffer();
+    expectedB.fill(0xFF);
+    expectedL.fill(0);
+    expectedM.fill(0);
+    expectedB[markerOffsets[index]] &= ~markerBits[index];
+    expectedL[markerOffsets[index]] = expectedM[markerOffsets[index]] = markerBits[index];
+    expect(stagedB.data(), expectedB.data(), 48000, "rotated reader B marker");
+    expect(stagedL.data(), expectedL.data(), 48000, "rotated reader L marker");
+    expect(stagedM.data(), expectedM.data(), 48000, "rotated reader M marker");
+  }
+  renderer.clearScreen();
+  require(renderer.setUiGrayEnabled(false), "disable retained gray for legacy control");
+  renderer.clearScreen();
+  const int before = graySubmissions;
+  {
+    GfxRenderer::ScopedTarget scratch(renderer, Owner::ReaderScratch);
+    renderer.clearScreen(0);
+    renderer.copyGrayscaleLsbBuffers();
+    renderer.copyGrayscaleMsbBuffers();
+  }
+  renderer.displayGrayBuffer();
+  require(graySubmissions == before + 1, "disabled reader scratch retains legacy gray submission");
+  const int binaryBefore = submissions;
+  renderer.displayBuffer();
+  require(submissions == binaryBefore + 1 && graySubmissions == before + 1, "AA off UI submits BW only");
+}
+
 int main() {
   HalDisplay hal;
   {
@@ -417,7 +601,9 @@ int main() {
     require(submissions == 0, "loan refuses HAL submission");
   }
   testOwnership(hal, renderer);
-  std::puts("PASS: actual renderer HAL/strip binding, pixel transforms, DirectPixelWriter, ownership, allocation, cancellation and loans");
+  testUiSubmission(renderer);
+  testReaderImport(renderer);
+  std::puts("PASS: actual renderer binding, ownership, clipped reader imports, B restoration, gray submission, cancellation and fallback");
   }
   require(liveAllocations == 0, "renderer destruction releases pair");
 }
@@ -670,14 +856,28 @@ class RendererSeamTest(unittest.TestCase):
             mutant_object = work / "renderer-mutant.o"
             mutant_binary = work / "gfx-gray-mutant"
             mutants = [
-                ("strip clear", "    return;\n  }\n  display.clearScreen(color);",
-                 "  }\n  display.clearScreen(color);", "strip preserves HAL: byte 0 expected FF, actual 00"),
+                ("strip clear", "    return;\n  }\n  if (readerImportCurrent()) {",
+                 "  }\n  if (readerImportCurrent()) {", "strip preserves HAL: byte 0 expected FF, actual 00"),
                 ("scope restoration", "  renderer_.target_ = previous_;", "  renderer_.target_ = {};",
                  "nested target restores pointer and physical band: expected true, actual false"),
+                ("OR import", "    GrayFrame::copyPlaneRow(destination + y * panelWidthBytes, source + (y - yStart) * panelWidthBytes,\n                            readerImport_.x0, readerImport_.x1);",
+                 "    for (int x = readerImport_.x0 / 8; x < (readerImport_.x1 + 7) / 8; ++x) destination[y * panelWidthBytes + x] |= source[(y - yStart) * panelWidthBytes + x];",
+                 "import forwards whole L row with UI marker: expected true, actual false"),
+                ("erase outside marker", "                            readerImport_.x0, readerImport_.x1);",
+                 "                            0, panelWidth);", "import forwards whole L row with UI marker: expected true, actual false"),
+                ("accept incomplete", "    if (readerImport_.coverage[y] != 7) return false;", "    if (false) return false;",
+                 "incomplete selector coverage rejects completion: expected true, actual false"),
+                ("accept cancelled", "bool GfxRenderer::finishReaderImport() const {\n  if (!readerImportCurrent()) return false;",
+                 "bool GfxRenderer::finishReaderImport() const {\n  if (target_.owner != FrameOwner::ReaderScratch) return false;", "cancelled reader import rejected: expected true, actual false"),
+                ("omit gray submission", "  if (!accountCancellation()) display.displayGrayBuffer(fadingFix);\n  return true;",
+                 "  return true;", "UI marker submits exactly one gray frame: expected true, actual false"),
             ]
             for name, original, replacement, expected_error in mutants:
-                self.assertEqual(source.count(original), 1, f"{name} mutant anchor changed")
-                mutated.write_text(source.replace(original, replacement))
+                pattern = r"\s+".join(re.escape(part) for part in original.split())
+                matches = list(re.finditer(pattern, source))
+                self.assertEqual(len(matches), 1, f"{name} mutant anchor changed")
+                match = matches[0]
+                mutated.write_text(source[:match.start()] + replacement + source[match.end():])
                 subprocess.run([*cxx, "-std=c++17", *common, "-c", str(mutated), "-o", str(mutant_object)], check=True)
                 subprocess.run([*cxx, dead_strip, str(mutant_object), *objects[1:], "-o", str(mutant_binary)], check=True)
                 result = subprocess.run([str(mutant_binary)], capture_output=True, text=True)

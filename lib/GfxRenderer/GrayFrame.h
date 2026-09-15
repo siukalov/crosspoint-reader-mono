@@ -72,6 +72,15 @@ class GrayFrame {
     return true;
   }
 
+  static void copyPlaneRow(uint8_t* destination, const uint8_t* source, size_t x0, size_t x1, uint8_t fill = 0) {
+    for (size_t byteX = x0 / 8; byteX < (x1 + 7) / 8; ++byteX) {
+      const size_t first = byteX * 8 < x0 ? x0 - byteX * 8 : 0;
+      const size_t last = byteX * 8 + 8 > x1 ? x1 - byteX * 8 : 8;
+      const uint8_t mask = (0xFF >> first) & (0xFF << (8 - last));
+      replace(destination[byteX], mask, source ? source[byteX] : fill);
+    }
+  }
+
   bool fill(uint8_t darkness) const {
     if (darkness > 3 || !valid()) return false;
     const size_t size = rows_ * stride_;
