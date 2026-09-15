@@ -19,12 +19,11 @@
 
 void SleepActivity::onEnter() {
   Activity::onEnter();
-#if FREEINK_DEVICE_PAPERMONO
-  // Sleep screens are drawn synchronously rather than by ActivityManager's
-  // render task. Open an explicit display generation so a staged grayscale
-  // cover can be committed before the EPD rail is cut.
+  RenderLock lock;
   renderer.beginDisplayWork();
-#endif
+  GfxRenderer::ScopedTarget liveUi(renderer, GfxRenderer::FrameOwner::LiveUi);
+  if (!liveUi.active()) return;
+  renderer.setRenderMode(GfxRenderer::BW);
 
   const bool renderQuickResume =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
@@ -35,13 +34,11 @@ void SleepActivity::onEnter() {
     return renderLastScreenSleepScreen();
   }
 
-  // Show popup with reader orientation only when going to sleep from reader
-  if (APP_STATE.lastSleepFromReader) {
-    ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+  if (renderer.canCaptureLiveFrame()) {
+    const bool fromReader = APP_STATE.lastSleepFromReader;
+    if (fromReader) ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
     GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
-    renderer.setOrientation(GfxRenderer::Orientation::Portrait);
-  } else {
-    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
+    if (fromReader) renderer.setOrientation(GfxRenderer::Orientation::Portrait);
   }
 
   switch (SETTINGS.sleepScreen) {
@@ -63,13 +60,9 @@ void SleepActivity::onEnter() {
 }
 
 void SleepActivity::renderCustomSleepScreen() const {
-  // Check if we have a /.sleep (preferred) or /sleep directory
   const char* sleepDir = nullptr;
   auto dir = Storage.open("/.sleep");
 
-  // Look for sleep.bmp on the root of the sd card to determine if we should
-  // render a custom sleep screen instead of the default.
-  // This takes priority over the /sleep folder.
   HalFile file;
   if (Storage.openFileForRead("SLP", "/sleep.bmp", file)) {
     Bitmap bitmap(file, true);
@@ -95,7 +88,6 @@ void SleepActivity::renderCustomSleepScreen() const {
   if (sleepDir) {
     std::vector<std::string> files;
     char name[500];
-    // collect all valid BMP files
     for (auto dirFile = dir.openNextFile(); dirFile; dirFile = dir.openNextFile()) {
       if (dirFile.isDirectory()) {
         dirFile.close();
@@ -124,8 +116,6 @@ void SleepActivity::renderCustomSleepScreen() const {
     }
     const auto numFiles = files.size();
     if (numFiles > 0) {
-      // Pick a random wallpaper, excluding recently shown ones.
-      // Window: up to SLEEP_RECENT_COUNT entries, capped at numFiles-1.
       const uint16_t fileCount = static_cast<uint16_t>(std::min(numFiles, static_cast<size_t>(UINT16_MAX)));
       const uint8_t window =
           static_cast<uint8_t>(std::min(static_cast<size_t>(APP_STATE.recentSleepFill), numFiles - 1));
@@ -156,17 +146,11 @@ void SleepActivity::renderCustomSleepScreen() const {
   renderDefaultSleepScreen();
 }
 
-// Non-Mono sleep screens retain the stock single-HALF behavior. Paper Mono's
-// default lock screen explicitly uses its endpoint-sweep FULL mode below.
 void SleepActivity::renderDefaultSleepScreen() const {
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
 #if FREEINK_DEVICE_PAPERMONO
-  // Sleep is the one place where latency is secondary to a stable retained
-  // image. Finish a white -> black endpoint cleaning run first. The final logo
-  // is then presented from a known black state, so its central white area gets
-  // a definite black-to-white transition instead of retaining reader gray.
   renderer.clearScreen(0xFF);
   renderer.displayBuffer(HalDisplay::FULL_REFRESH);
   renderer.clearScreen(0x00);
@@ -178,13 +162,11 @@ void SleepActivity::renderDefaultSleepScreen() const {
   renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 70, tr(STR_CROSSPOINT), true, EpdFontFamily::BOLD);
   renderer.drawCenteredText(SMALL_FONT_ID, pageHeight / 2 + 95, tr(STR_SLEEPING));
 
-  // Make sleep screen dark unless light is selected in settings
   if (SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::LIGHT) {
     renderer.invertScreen();
   }
 
 #if FREEINK_DEVICE_PAPERMONO
-  // Final, non-cancellable logo commit after the endpoint cleaning run.
   renderer.displayBuffer(HalDisplay::FULL_REFRESH);
 #else
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
@@ -199,13 +181,11 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
 
   LOG_DBG("SLP", "bitmap %d x %d, screen %d x %d", bitmap.getWidth(), bitmap.getHeight(), pageWidth, pageHeight);
   if (bitmap.getWidth() > pageWidth || bitmap.getHeight() > pageHeight) {
-    // image will scale, make sure placement is right
     float ratio = static_cast<float>(bitmap.getWidth()) / static_cast<float>(bitmap.getHeight());
     const float screenRatio = static_cast<float>(pageWidth) / static_cast<float>(pageHeight);
 
     LOG_DBG("SLP", "bitmap ratio: %f, screen ratio: %f", ratio, screenRatio);
     if (ratio > screenRatio) {
-      // image wider than viewport ratio, scaled down image needs to be centered vertically
       if (SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP) {
         cropX = 1.0f - (screenRatio / ratio);
         LOG_DBG("SLP", "Cropping bitmap x: %f", cropX);
@@ -215,7 +195,6 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
       y = std::round((static_cast<float>(pageHeight) - static_cast<float>(pageWidth) / ratio) / 2);
       LOG_DBG("SLP", "Centering with ratio %f to y=%d", ratio, y);
     } else {
-      // image taller than viewport ratio, scaled down image needs to be centered horizontally
       if (SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP) {
         cropY = 1.0f - (ratio / screenRatio);
         LOG_DBG("SLP", "Cropping bitmap y: %f", cropY);
@@ -226,7 +205,6 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
       LOG_DBG("SLP", "Centering with ratio %f to x=%d", ratio, x);
     }
   } else {
-    // center the image
     x = (pageWidth - bitmap.getWidth()) / 2;
     y = (pageHeight - bitmap.getHeight()) / 2;
   }
@@ -236,46 +214,71 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
 
   const bool hasGreyscale =
 #if FREEINK_DEVICE_PAPERMONO
-      false;  // Paper Mono non-reader surfaces stay binary on the internal OTP waveform.
+      false;
 #else
       bitmap.hasGreyscale() &&
       SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
 #endif
 
-  renderer.setRenderMode(hasGreyscale ? GfxRenderer::BW_GRAY_BASE : GfxRenderer::BW);
-  renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
-  renderer.setRenderMode(GfxRenderer::BW);
+  {
+    GfxRenderer::ScopedTarget base(renderer, GfxRenderer::FrameOwner::ReaderBase);
+    renderer.setRenderMode(hasGreyscale ? GfxRenderer::BW_GRAY_BASE : GfxRenderer::BW);
+    renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
+  }
 
   if (SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::INVERTED_BLACK_AND_WHITE) {
     renderer.invertScreen();
   }
 
-  if (hasGreyscale) {
-    // OEM grayscale pipeline base. Must stay HALF: the gray nudge LUT is
-    // calibrated against the pixel state the single-pass HALF waveform leaves
-    // behind. A FULL (GC) base parks pixels in a different charge state and
-    // the differential nudge then lands unevenly (blotchy noise in gray areas).
-    renderer.displayGrayscaleBase(HalDisplay::HALF_REFRESH);
-  } else {
+  if (!hasGreyscale) {
     renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    return;
   }
 
-  if (hasGreyscale) {
-    bitmap.rewindToData();
-    renderer.clearScreen(0x00);
-    renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
-    renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
-    renderer.copyGrayscaleLsbBuffers();
+  renderer.displayGrayscaleBase(HalDisplay::HALF_REFRESH);
+  bool grayReady = false;
+  {
+    GfxRenderer::ScopedTarget scratch(renderer, GfxRenderer::FrameOwner::ReaderScratch);
+    if (renderer.storeReaderBwScratch()) {
+      const bool imported = [&]() {
+        if (renderer.uiGrayEnabled() && !renderer.beginReaderImport(0, 0, pageWidth, pageHeight)) return false;
+        for (const bool lsb : {true, false}) {
+          bitmap.rewindToData();
+          renderer.clearScreen(0x00);
+          renderer.setRenderMode(lsb ? GfxRenderer::GRAYSCALE_LSB : GfxRenderer::GRAYSCALE_MSB);
+          renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
+          if (renderer.displayWorkAborted()) return false;
+          if (renderer.uiGrayEnabled()) {
+            if (!renderer.importReaderPlane(lsb, renderer.getFrameBuffer(), renderer.getBufferSize(), 0,
+                                            renderer.getDisplayHeight()))
+              return false;
+          } else if (lsb) {
+            renderer.copyGrayscaleLsbBuffers();
+          } else {
+            renderer.copyGrayscaleMsbBuffers();
+          }
+        }
+        return true;
+      }();
+      const bool restored = renderer.restoreReaderBwScratch();
+      grayReady = imported && restored && (!renderer.uiGrayEnabled() || renderer.finishReaderImport());
+    }
+  }
 
+  if (renderer.displayWorkAborted()) return;
+  if (!grayReady) {
     bitmap.rewindToData();
-    renderer.clearScreen(0x00);
-    renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
-    renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
-    renderer.copyGrayscaleMsbBuffers();
-
-    renderer.displayGrayBuffer();
+    renderer.clearScreen();
+    GfxRenderer::ScopedTarget base(renderer, GfxRenderer::FrameOwner::ReaderBase);
     renderer.setRenderMode(GfxRenderer::BW);
+    renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    return;
   }
+
+  GfxRenderer::ScopedTarget base(renderer, GfxRenderer::FrameOwner::ReaderBase);
+  renderer.setRenderMode(GfxRenderer::BW);
+  renderer.displayGrayBuffer();
 }
 
 void SleepActivity::renderCoverSleepScreen() const {
@@ -296,9 +299,7 @@ void SleepActivity::renderCoverSleepScreen() const {
   std::string coverBmpPath;
   bool cropped = SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP;
 
-  // Check if the current book is XTC, TXT, or EPUB
   if (FsHelpers::hasXtcExtension(APP_STATE.openEpubPath)) {
-    // Handle XTC file
     Xtc lastXtc(APP_STATE.openEpubPath, "/.crosspoint");
     if (!lastXtc.load()) {
       LOG_ERR("SLP", "Failed to load last XTC");
@@ -312,7 +313,6 @@ void SleepActivity::renderCoverSleepScreen() const {
 
     coverBmpPath = lastXtc.getCoverBmpPath();
   } else if (FsHelpers::hasTxtExtension(APP_STATE.openEpubPath)) {
-    // Handle TXT file - looks for cover image in the same folder
     Txt lastTxt(APP_STATE.openEpubPath, "/.crosspoint");
     if (!lastTxt.load()) {
       LOG_ERR("SLP", "Failed to load last TXT");
@@ -326,9 +326,7 @@ void SleepActivity::renderCoverSleepScreen() const {
 
     coverBmpPath = lastTxt.getCoverBmpPath();
   } else if (FsHelpers::hasEpubExtension(APP_STATE.openEpubPath)) {
-    // Handle EPUB file
     Epub lastEpub(APP_STATE.openEpubPath, "/.crosspoint");
-    // Skip loading css since we only need metadata here
     if (!lastEpub.load(true, true)) {
       LOG_ERR("SLP", "Failed to load last epub");
       return (this->*renderNoCoverSleepScreen)();
@@ -358,11 +356,10 @@ void SleepActivity::renderCoverSleepScreen() const {
 }
 
 void SleepActivity::renderLastScreenSleepScreen() const {
+  if (!renderer.canCaptureLiveFrame()) return renderDefaultSleepScreen();
   const auto pageHeight = renderer.getScreenHeight();
   renderer.drawImage(MoonIcon, 0, pageHeight - MOONICON_HEIGHT, MOONICON_WIDTH, MOONICON_HEIGHT);
   if (gpio.deviceIsX3()) {
-    // The controller still holds the displayed page, so its differential base
-    // waveform can add the moon without a full-screen flash.
     renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
   } else {
     renderer.displayBuffer(HalDisplay::HALF_REFRESH);
