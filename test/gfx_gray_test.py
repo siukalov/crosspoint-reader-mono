@@ -117,6 +117,9 @@ static std::array<uint8_t, 48000> physical;
 static GfxRenderer* captureAbortRenderer = nullptr;
 static uint8_t* captureAbortDestination = nullptr;
 static int captureAbortHits = 0;
+static const uint8_t* restoreAbortL = nullptr;
+static const uint8_t* restoreAbortM = nullptr;
+static bool restoreAbortSawMixed = false;
 extern "C" void* memcpy(void* destination, const void* source, size_t size)
     noexcept(noexcept(std::memcpy(destination, source, size))) {
   void* result = std::memmove(destination, source, size);
@@ -124,6 +127,9 @@ extern "C" void* memcpy(void* destination, const void* source, size_t size)
     GfxRenderer* renderer = captureAbortRenderer;
     captureAbortRenderer = nullptr;
     ++captureAbortHits;
+    if (restoreAbortL && restoreAbortM)
+      restoreAbortSawMixed = *static_cast<uint8_t*>(destination) == 0xCC &&
+                             *restoreAbortL == 0x11 && *restoreAbortM == 0x55;
     renderer->abortDisplayWork();
   }
   return result;
@@ -1177,7 +1183,7 @@ static void testSnapshots(HalDisplay& hal) {
   require(snapshot.kind == GfxRenderer::SnapshotKind::RetainedTuple && snapshot.planes.valid() &&
           snapshot.planes.width() == 8 && snapshot.planes.stride() == 1 && snapshot.planes.rows() == 1 &&
           snapshot.planes.y0() == 2 && snapshot.physicalByteX == 0 && snapshot.panelWidth == 800 &&
-          snapshot.panelHeight == 480 && snapshot.panelStride == 100 && snapshot.restoreEpoch == 0,
+          snapshot.panelHeight == 480 && snapshot.panelStride == 100 && snapshot.restoreEpoch == 2,
           "retained capture metadata");
   require(snapshot.planes.b().data == packed.data() + 1 && snapshot.planes.l().data == packed.data() + 2 &&
           snapshot.planes.m().data == packed.data() + 3 && snapshot.planes.b().capacity == 1 &&
@@ -1302,6 +1308,247 @@ static void testSnapshots(HalDisplay& hal) {
   require(submissions + graySubmissions + baseSubmissions == before, "captures submit no display work");
 }
 
+static void testRegionSnapshots(HalDisplay& hal) {
+  using Result = GfxRenderer::FrameResult;
+  using Snapshot = GfxRenderer::FrameSnapshot;
+  GfxRenderer renderer(hal);
+  renderer.begin();
+  renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  require(renderer.setUiGrayEnabled(true), "restore enables retained tuple");
+  renderer.clearScreen();
+  auto tuple = renderer.getWriteTuple();
+  std::memset(tuple.b().data, 0xCC, 48000);
+  std::memset(tuple.l().data, 0x22, 48000);
+  std::memset(tuple.m().data, 0x66, 48000);
+  tuple.b().data[201] = 0x33;
+  tuple.l().data[201] = 0x44;
+  std::array<uint8_t, 5> packed{0xA5, 0, 0, 0, 0xA5};
+  Snapshot snapshot;
+  require(renderer.captureRegion(1, 2, 5, 1, {packed.data() + 1, 3}, snapshot) == Result::Ok,
+          "restore captures aligned byte");
+  const auto savedStorage = packed;
+  std::array<uint8_t, 48000> originalB, originalL, originalM;
+  std::memcpy(originalB.data(), tuple.b().data, 48000);
+  std::memcpy(originalL.data(), tuple.l().data, 48000);
+  std::memcpy(originalM.data(), tuple.m().data, 48000);
+  tuple.b().data[200] = tuple.l().data[200] = tuple.m().data[200] = 0;
+  const int before = submissions + graySubmissions + baseSubmissions;
+  require(renderer.restoreRegion(snapshot) == Result::Ok, "restore aligned byte accepted");
+  expect(tuple.b().data, originalB.data(), 48000, "restore literal B padding and neighbor");
+  expect(tuple.l().data, originalL.data(), 48000, "restore literal L padding and neighbor");
+  expect(tuple.m().data, originalM.data(), 48000, "restore literal M padding and neighbor");
+  expect(packed.data(), savedStorage.data(), packed.size(), "restore preserves source and canaries");
+
+  auto reject = [&](const Snapshot& source, Result result, const char* name) {
+    std::array<uint8_t, 48000> b, l, m;
+    std::memcpy(b.data(), tuple.b().data, 48000);
+    std::memcpy(l.data(), tuple.l().data, 48000);
+    std::memcpy(m.data(), tuple.m().data, 48000);
+    require(renderer.restoreRegion(source) == result, name);
+    expect(tuple.b().data, b.data(), 48000, "rejected restore preserves B");
+    expect(tuple.l().data, l.data(), 48000, "rejected restore preserves L");
+    expect(tuple.m().data, m.data(), 48000, "rejected restore preserves M");
+    expect(packed.data(), savedStorage.data(), packed.size(), "rejected restore preserves source and canaries");
+  };
+  for (int plane = 0; plane < 3; ++plane) {
+    GrayFrame::Plane views[] = {snapshot.planes.b(), snapshot.planes.l(), snapshot.planes.m()};
+    views[plane].capacity = 0;
+    Snapshot bad = snapshot;
+    bad.planes = GrayFrame(views[0], views[1], views[2], 8, 1, 1, 2);
+    reject(bad, Result::ShortCapacity, "restore short source rejected");
+    views[plane] = {nullptr, 1};
+    bad.planes = GrayFrame(views[0], views[1], views[2], 8, 1, 1, 2);
+    reject(bad, Result::InvalidSource, "restore null source rejected");
+    views[plane] = {reinterpret_cast<uint8_t*>(std::numeric_limits<uintptr_t>::max()), 1};
+    bad.planes = GrayFrame(views[0], views[1], views[2], 8, 1, 1, 2);
+    reject(bad, Result::InvalidSource, "restore source address overflow rejected");
+  }
+  for (auto destination : {tuple.b().data, tuple.l().data, tuple.m().data}) {
+    for (size_t offset : {size_t(0), size_t(17), size_t(47999)}) {
+      Snapshot bad = snapshot;
+      bad.planes = GrayFrame({destination + offset, 1}, snapshot.planes.l(), snapshot.planes.m(), 8, 1, 1, 2);
+      reject(bad, Result::InvalidSource, "restore offset alias rejected");
+    }
+  }
+  for (int first = 0; first < 3; ++first) {
+    for (int second = first + 1; second < 3; ++second) {
+      GrayFrame::Plane views[] = {snapshot.planes.b(), snapshot.planes.l(), snapshot.planes.m()};
+      views[second] = views[first];
+      Snapshot bad = snapshot;
+      bad.planes = GrayFrame(views[0], views[1], views[2], 8, 1, 1, 2);
+      reject(bad, Result::InvalidSource, "restore source planes overlap rejected");
+    }
+  }
+  std::array<uint8_t, 16> overlap{};
+  Snapshot bad = snapshot;
+  bad.planes = GrayFrame({overlap.data(), 4}, {overlap.data() + 3, 4}, {overlap.data() + 8, 4}, 16, 2, 2, 2);
+  reject(bad, Result::InvalidSource, "restore offset source planes overlap rejected");
+  require(overlap == std::array<uint8_t, 16>{}, "overlap rejection preserves source");
+  bad = snapshot; bad.valid = false;
+  reject(bad, Result::InvalidSource, "restore invalid descriptor rejected");
+  bad = snapshot; bad.kind = static_cast<GfxRenderer::SnapshotKind>(99);
+  reject(bad, Result::InvalidSource, "restore unknown kind rejected");
+  bad = snapshot; bad.kind = GfxRenderer::SnapshotKind::LegacyBw;
+  reject(bad, Result::PolicyMismatch, "restore BW under retained policy rejected");
+  for (int field = 0; field < 4; ++field) {
+    bad = snapshot;
+    if (field == 0) --bad.panelWidth;
+    if (field == 1) --bad.panelHeight;
+    if (field == 2) --bad.panelStride;
+    if (field == 3) bad.orientation = GfxRenderer::Portrait;
+    reject(bad, Result::GeometryMismatch, "restore mismatched panel geometry rejected");
+  }
+  for (size_t byteX : {size_t(100), std::numeric_limits<size_t>::max()}) {
+    bad = snapshot; bad.physicalByteX = byteX;
+    reject(bad, Result::InvalidSource, "restore invalid byte origin rejected");
+  }
+  const size_t invalidGeometry[][4] = {{0,1,1,2}, {801,1,101,2}, {7,1,1,2}, {8,0,1,2}, {8,479,1,2},
+      {8,1,0,2}, {8,1,2,2}, {8,1,1,480}, {8,SIZE_MAX,1,2}, {8,1,SIZE_MAX,2}, {SIZE_MAX,1,1,2}};
+  for (const auto& g : invalidGeometry) {
+    bad = snapshot;
+    bad.planes = GrayFrame(snapshot.planes.b(), snapshot.planes.l(), snapshot.planes.m(), g[0], g[1], g[2], g[3]);
+    reject(bad, Result::InvalidSource, "restore malformed plane geometry rejected");
+  }
+  bad = snapshot;
+  bad.planes = GrayFrame({packed.data() + 1, SIZE_MAX}, {packed.data() + 2, SIZE_MAX},
+                        {packed.data() + 3, SIZE_MAX}, 8, 1, 1, 2);
+  require(renderer.restoreRegion(bad) == Result::Ok, "restore checks used extent instead of full capacity");
+
+  std::array<uint8_t, 8> multirow{0xA5, 0, 0, 0, 0, 0, 0, 0xA5};
+  Snapshot twoRows;
+  tuple.b().data[501] = 0xCC; tuple.b().data[601] = 0x33;
+  tuple.l().data[501] = 0x22; tuple.l().data[601] = 0x44;
+  tuple.m().data[501] = 0x66; tuple.m().data[601] = 0x77;
+  require(renderer.captureRegion(9, 5, 5, 2, {multirow.data() + 1, 6}, twoRows) == Result::Ok,
+          "restore captures multiple rows at nonzero byte origin");
+  const uint8_t literalRows[] = {0xCC, 0x33, 0x22, 0x44, 0x66, 0x77};
+  expect(multirow.data() + 1, literalRows, 6, "multirow source literal bytes");
+  for (auto destination : {tuple.b().data, tuple.l().data, tuple.m().data}) {
+    destination[501] = destination[601] = 0;
+    destination[500] = destination[502] = destination[600] = destination[602] = 0xA5;
+  }
+  require(renderer.restoreRegion(twoRows) == Result::Ok, "restore multiple rows accepted");
+  const uint8_t restoredRows[] = {tuple.b().data[501], tuple.b().data[601], tuple.l().data[501],
+      tuple.l().data[601], tuple.m().data[501], tuple.m().data[601]};
+  expect(restoredRows, literalRows, 6, "restore uses physical byte origin and panel row stride");
+  for (auto destination : {tuple.b().data, tuple.l().data, tuple.m().data})
+    require(destination[500] == 0xA5 && destination[502] == 0xA5 &&
+            destination[600] == 0xA5 && destination[602] == 0xA5, "multirow restore preserves neighboring bytes");
+  require(multirow.front() == 0xA5 && multirow.back() == 0xA5, "multirow restore preserves source canaries");
+
+  for (auto owner : {GfxRenderer::FrameOwner::ReaderBase, GfxRenderer::FrameOwner::ReaderScratch}) {
+    GfxRenderer::ScopedTarget scope(renderer, owner);
+    reject(snapshot, Result::Unavailable, "reader target rejects region restore");
+  }
+  reject(snapshot, Result::InvalidLive, "restore rejects invalid live with matching epoch");
+  renderer.clearScreen();
+  require(renderer.restoreRegion(snapshot) == Result::Ok, "clear repairs live without changing epoch");
+  std::array<uint8_t, 300> offscreen{};
+  {
+    GfxRenderer::ScopedTarget scope(renderer, offscreen.data(), 0, 1);
+    reject(snapshot, Result::Unavailable, "strip target rejects region restore");
+  }
+  {
+    bool coherent = true;
+    GrayFrame frame({offscreen.data(), 100}, {offscreen.data() + 100, 100}, {offscreen.data() + 200, 100}, 800, 1, 100);
+    GfxRenderer::ScopedTarget scope(renderer, frame, coherent);
+    reject(snapshot, Result::Unavailable, "offscreen target rejects region restore");
+    renderer.abortDisplayWork();
+  }
+  renderer.beginDisplayWork();
+  require(renderer.restoreRegion(snapshot) == Result::Ok, "offscreen cancellation preserves live epoch");
+
+  const uint64_t originalEpoch = snapshot.restoreEpoch;
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  require(renderer.setUiGrayEnabled(true), "restore unchanged enabled policy accepted");
+  renderer.beginDisplayWork();
+  renderer.clearScreen();
+  require(renderer.restoreRegion(snapshot) == Result::Ok, "clear and new work preserve region epoch");
+  Snapshot current;
+  std::array<uint8_t, 3> currentStorage{};
+  auto captureCurrent = [&]() {
+    require(renderer.captureRegion(1, 2, 5, 1, {currentStorage.data(), 3}, current) == Result::Ok,
+            "capture current restore epoch");
+  };
+  captureCurrent();
+  require(current.restoreEpoch == originalEpoch, "no-op controls preserve epoch");
+  renderer.setOrientation(GfxRenderer::Portrait);
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  reject(snapshot, Result::InvalidLive, "restore stale orientation epoch rejected");
+  captureCurrent();
+  require(current.restoreEpoch == originalEpoch + 2, "orientation away and back advances epoch twice");
+  snapshot = current;
+  require(renderer.setUiGrayEnabled(false) && renderer.setUiGrayEnabled(false) && renderer.setUiGrayEnabled(true),
+          "policy away and back accepted");
+  reject(snapshot, Result::InvalidLive, "restore cannot repair invalid live");
+  renderer.clearScreen();
+  reject(snapshot, Result::InvalidLive, "restore stale policy epoch rejected after clear");
+  captureCurrent();
+  require(current.restoreEpoch == originalEpoch + 4, "only actual policy changes advance epoch");
+  snapshot = current;
+  {
+    GfxRenderer::FrameBufferLoan outer(renderer);
+    require(outer.active(), "outer loan acquires storage");
+    GfxRenderer::FrameBufferLoan inner(renderer);
+    require(!inner.active(), "nested loan reports inactive");
+    inner.end();
+    require(!renderer.hasFrameBuffer() && outer.active(), "inactive inner loan cannot return outer storage");
+    require(renderer.restoreRegion(snapshot) == Result::Unavailable, "loan rejects restore");
+    outer.end(); outer.end();
+    require(!outer.active() && renderer.hasFrameBuffer(), "loan end is idempotent");
+  }
+  for (size_t i = 0; i < 48000; ++i)
+    require(tuple.b().data[i] == 0xFF && tuple.l().data[i] == 0 && tuple.m().data[i] == 0,
+            "loan return restores white B and zero selectors");
+  reject(snapshot, Result::InvalidLive, "loan return requires redraw before restore");
+  renderer.clearScreen();
+  reject(snapshot, Result::InvalidLive, "restore stale loan epoch rejected after clear");
+  captureCurrent();
+  require(current.restoreEpoch == originalEpoch + 5, "only successful loan acquisition advances epoch");
+
+  snapshot = current;
+  const uint64_t beforeAbortEpoch = current.restoreEpoch;
+  renderer.abortDisplayWork();
+  require(renderer.liveFrameValid(), "input abort leaves render-thread validity unchanged");
+  reject(snapshot, Result::Cancelled, "pre-aborted restore rejected without writes");
+  require(renderer.liveFrameNeedsRedraw(), "render thread accounts live cancellation");
+  renderer.beginDisplayWork(); renderer.clearScreen();
+  reject(snapshot, Result::InvalidLive, "restore stale cancellation epoch rejected after clear");
+  captureCurrent();
+  require(current.restoreEpoch == beforeAbortEpoch + 1, "live cancellation advances epoch once");
+
+  tuple.b().data[200] = 0xCC; tuple.l().data[200] = 0x22; tuple.m().data[200] = 0x66;
+  require(renderer.captureRegion(1, 2, 5, 1, {currentStorage.data(), 3}, current) == Result::Ok,
+          "late restore captures source");
+  tuple.b().data[200] = 0x33; tuple.l().data[200] = 0x11; tuple.m().data[200] = 0x55;
+  restoreAbortL = tuple.l().data + 200; restoreAbortM = tuple.m().data + 200;
+  captureAbortDestination = tuple.b().data + 200;
+  captureAbortHits = 0; restoreAbortSawMixed = false; captureAbortRenderer = &renderer;
+  require(renderer.restoreRegion(current) == Result::PublishedCancelled,
+          "mid-copy abort reports accepted cancelled restore");
+  require(captureAbortHits == 1 && restoreAbortSawMixed, "restore abort observes new B and old selectors exactly once");
+  const uint8_t finalTuple[] = {tuple.b().data[200], tuple.l().data[200], tuple.m().data[200]};
+  const uint8_t literalTuple[] = {0xCC, 0x22, 0x66};
+  expect(finalTuple, literalTuple, 3, "accepted cancelled restore completes tuple");
+  require(renderer.liveFrameNeedsRedraw(), "accepted cancelled restore invalidates live");
+  renderer.displayBuffer();
+  require(submissions + graySubmissions + baseSubmissions == before, "region restores never submit HAL work");
+  restoreAbortL = restoreAbortM = nullptr;
+
+  renderer.beginDisplayWork(); renderer.clearScreen();
+  require(renderer.setUiGrayEnabled(false), "restore disables tuple policy");
+  renderer.clearScreen();
+  std::array<uint8_t, 1> legacy{0xCC};
+  require(renderer.captureRegion(1, 2, 5, 1, {legacy.data(), 1}, snapshot) == Result::Ok,
+          "legacy restore captures single plane");
+  legacy[0] = 0xCC; tuple.b().data[200] = 0x33;
+  require(renderer.restoreRegion(snapshot) == Result::Ok && tuple.b().data[200] == 0xCC,
+          "legacy restore accepts absent selectors");
+  snapshot.kind = GfxRenderer::SnapshotKind::RetainedTuple;
+  reject(snapshot, Result::PolicyMismatch, "restore tuple under BW policy rejected");
+}
+
 int main() {
   HalDisplay hal;
   {
@@ -1378,6 +1625,7 @@ int main() {
   testGlyphCoverage(hal);
   testOpaqueWriters(hal);
   testSnapshots(hal);
+  testRegionSnapshots(hal);
   std::puts("PASS: actual renderer ownership, submission, imports, glyphs, opaque writers, image clipping and stale target controls");
   }
   require(liveAllocations == 0, "renderer destruction releases pair");
@@ -1677,6 +1925,19 @@ class RendererSeamTest(unittest.TestCase):
                  "wide endpoint clipping remains visible: expected true, actual false"),
                 ("publish cancelled capture", "if (accountCancellation()) return FrameResult::Cancelled; const GrayFrame::Plane b",
                  "const GrayFrame::Plane b", "late capture abort invalidates descriptor: expected true, actual false"),
+            ]
+            mutants += [
+                ("restore only B", "const size_t planeCount = uiGrayEnabled_ ? 3 : 1; for (size_t plane = 0; plane < planeCount; ++plane)",
+                 "const size_t planeCount = 1; for (size_t plane = 0; plane < planeCount; ++plane)",
+                 "restore literal L padding and neighbor: byte 200 expected 22, actual 00"),
+                ("skip restore capacity", "if (sources[plane].capacity < sourceBytes) return Result::ShortCapacity;",
+                 "if (false) return Result::ShortCapacity;", "restore short source rejected: expected true, actual false"),
+                ("ignore restore epoch", "if (!liveCoherent_ || source.restoreEpoch != restoreEpoch_) return FrameResult::InvalidLive;",
+                 "if (!liveCoherent_) return FrameResult::InvalidLive;", "restore stale orientation epoch rejected: expected true, actual false"),
+                ("inactive inner loan return", "void GfxRenderer::FrameBufferLoan::end() { if (!active_) return;",
+                 "void GfxRenderer::FrameBufferLoan::end() {", "nested loan cannot restore outer storage: expected true, actual false"),
+                ("accept restore offset alias", "if (addressRangesOverlap(sources[other].data, sourceBytes, destinations[plane], destinationBytes))",
+                 "if (sources[other].data == destinations[plane])", "restore offset alias rejected: expected true, actual false"),
             ]
             for name, original, replacement, expected_error in mutants:
                 pattern = r"\s+".join(re.escape(part) for part in original.split())

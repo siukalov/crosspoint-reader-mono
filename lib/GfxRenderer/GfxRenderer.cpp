@@ -150,6 +150,7 @@ bool GfxRenderer::setUiGrayEnabled(const bool enabled) {
   if (enabled && (!liveL_ || !liveM_)) return false;
   if (uiGrayEnabled_ != enabled) {
     uiGrayEnabled_ = enabled;
+    ++restoreEpoch_;
     liveCoherent_ = false;
     ++targetGeneration_;
   }
@@ -177,6 +178,7 @@ void GfxRenderer::invalidateTarget() const {
     if (target_.coherent) *target_.coherent = false;
   } else if (target_.owner == FrameOwner::LiveUi || target_.owner == FrameOwner::ReaderBase ||
              target_.owner == FrameOwner::ReaderScratch) {
+    ++restoreEpoch_;
     liveCoherent_ = false;
     readerImport_.active = false;
     target_.coherentOnEntry = false;
@@ -278,6 +280,7 @@ void GfxRenderer::releaseFrameBufferForBuild() {
   if (!scratch) return;
   frameBuffer = nullptr;
   target_.owner = FrameOwner::Loan;
+  ++restoreEpoch_;
   liveCoherent_ = false;
   ++targetGeneration_;
   buildscratch::lend(scratch, size);
@@ -478,6 +481,45 @@ bool addressRangesOverlap(const uint8_t* first, size_t firstBytes, const uint8_t
   const auto firstAddress = reinterpret_cast<uintptr_t>(first);
   const auto secondAddress = reinterpret_cast<uintptr_t>(second);
   return firstAddress < secondAddress + secondBytes && secondAddress < firstAddress + firstBytes;
+}
+bool snapshotGeometryValid(const GfxRenderer::FrameSnapshot& source) {
+  const auto& planes = source.planes;
+  if (!planes.width() || !planes.rows() || source.physicalByteX >= source.panelStride ||
+      source.physicalByteX > source.panelWidth / 8 || planes.y0() >= source.panelHeight)
+    return false;
+  const size_t remainingWidth = source.panelWidth - source.physicalByteX * 8;
+  if (planes.width() > remainingWidth || planes.rows() > source.panelHeight - planes.y0()) return false;
+  if (planes.width() % 8 && planes.width() != remainingWidth) return false;
+  const size_t rowBytes =
+      source.physicalByteX == 0 && planes.width() == source.panelWidth ? source.panelStride : (planes.width() + 7) / 8;
+  return planes.stride() == rowBytes;
+}
+
+GfxRenderer::FrameResult validateSnapshotPlanes(const GfxRenderer::FrameSnapshot& source,
+                                                uint8_t* const destinations[3], size_t destinationBytes,
+                                                size_t planeCount) {
+  using Result = GfxRenderer::FrameResult;
+  const GrayFrame::Plane sources[] = {source.planes.b(), source.planes.l(), source.planes.m()};
+  const size_t sourceBytes = source.planes.stride() * source.planes.rows();
+  for (size_t plane = 0; plane < planeCount; ++plane) {
+    if (!addressRangeFits(sources[plane].data, sourceBytes)) return Result::InvalidSource;
+    if (sources[plane].capacity < sourceBytes) return Result::ShortCapacity;
+  }
+  for (size_t plane = 0; plane < 3; ++plane) {
+    if (!destinations[plane] && plane >= planeCount) continue;
+    if (!addressRangeFits(destinations[plane], destinationBytes)) return Result::InvalidLive;
+    for (size_t other = 0; other < planeCount; ++other) {
+      if (addressRangesOverlap(sources[other].data, sourceBytes, destinations[plane], destinationBytes))
+        return Result::InvalidSource;
+    }
+  }
+  for (size_t plane = 0; plane < planeCount; ++plane) {
+    for (size_t other = plane + 1; other < planeCount; ++other) {
+      if (addressRangesOverlap(sources[plane].data, sourceBytes, sources[other].data, sourceBytes))
+        return Result::InvalidSource;
+    }
+  }
+  return Result::Ok;
 }
 }  // namespace
 
@@ -1934,6 +1976,43 @@ GfxRenderer::FrameResult GfxRenderer::captureRegion(int x, int y, int width, int
 
 GfxRenderer::FrameResult GfxRenderer::captureFrame(GrayFrame::Plane storage, FrameSnapshot& out) const {
   return captureRegion(0, 0, getScreenWidth(), getScreenHeight(), storage, out);
+}
+
+GfxRenderer::FrameResult GfxRenderer::validateSnapshot(const FrameSnapshot& source) const {
+  if (!source.valid || (source.kind != SnapshotKind::RetainedTuple && source.kind != SnapshotKind::LegacyBw))
+    return FrameResult::InvalidSource;
+  if ((source.kind == SnapshotKind::RetainedTuple) != uiGrayEnabled_) return FrameResult::PolicyMismatch;
+  if (source.panelWidth != panelWidth || source.panelHeight != panelHeight || source.panelStride != panelWidthBytes ||
+      source.orientation != orientation)
+    return FrameResult::GeometryMismatch;
+  if (!snapshotGeometryValid(source)) return FrameResult::InvalidSource;
+  const size_t destinationOffset = source.planes.y0() * panelWidthBytes + source.physicalByteX;
+  const size_t destinationBytes = (source.planes.rows() - 1) * panelWidthBytes + source.planes.stride();
+  if (destinationOffset > frameBufferSize || destinationBytes > frameBufferSize - destinationOffset)
+    return FrameResult::InvalidLive;
+  uint8_t* destinations[] = {frameBuffer, liveL_, liveM_};
+  return validateSnapshotPlanes(source, destinations, frameBufferSize, uiGrayEnabled_ ? 3 : 1);
+}
+
+GfxRenderer::FrameResult GfxRenderer::restoreRegion(const FrameSnapshot& source) const {
+  if (!frameBuffer || target_.strip || target_.owner != FrameOwner::LiveUi) return FrameResult::Unavailable;
+  if (accountCancellation()) return FrameResult::Cancelled;
+  if (!liveCoherent_ || source.restoreEpoch != restoreEpoch_) return FrameResult::InvalidLive;
+  const auto validation = validateSnapshot(source);
+  if (validation != FrameResult::Ok) return validation;
+  if (accountCancellation()) return FrameResult::Cancelled;
+
+  const uint8_t* sources[] = {source.planes.b().data, source.planes.l().data, source.planes.m().data};
+  uint8_t* destinations[] = {frameBuffer, liveL_, liveM_};
+  const size_t destinationOffset = source.planes.y0() * panelWidthBytes + source.physicalByteX;
+  const size_t planeCount = uiGrayEnabled_ ? 3 : 1;
+  for (size_t plane = 0; plane < planeCount; ++plane) {
+    for (size_t row = 0; row < source.planes.rows(); ++row) {
+      memcpy(destinations[plane] + destinationOffset + row * panelWidthBytes,
+             sources[plane] + row * source.planes.stride(), source.planes.stride());
+    }
+  }
+  return accountCancellation() ? FrameResult::PublishedCancelled : FrameResult::Ok;
 }
 
 size_t GfxRenderer::readFramebufferRegion(int x, int y, int w, int h, uint8_t* dst, size_t dstCapacity) const {

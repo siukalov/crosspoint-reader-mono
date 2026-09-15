@@ -136,6 +136,7 @@ class GfxRenderer {
   bool accountCancellation() const;
   bool canSubmit() const;
   void invalidateTarget() const;
+  FrameResult validateSnapshot(const FrameSnapshot& source) const;
   void bindStrip(uint8_t* primary, uint8_t* secondary, int y0, int rows) const;
 
   std::map<int, int> fallbackFontMap_;
@@ -169,6 +170,7 @@ class GfxRenderer {
   size_t frameSnapshotBytes() const;
   FrameResult captureRegion(int x, int y, int width, int height, GrayFrame::Plane storage, FrameSnapshot& out) const;
   FrameResult captureFrame(GrayFrame::Plane storage, FrameSnapshot& out) const;
+  FrameResult restoreRegion(const FrameSnapshot& source) const;
   const uint8_t* getLiveGrayPlane(bool lsb) const {
     return uiGrayEnabled_ && canCaptureLiveFrame() ? (lsb ? liveL_ : liveM_) : nullptr;
   }
@@ -243,7 +245,11 @@ class GfxRenderer {
   void ensureSdCardFontReady(int fontId, const std::vector<std::string>& words, bool includeHyphen,
                              uint8_t styleMask = 0x0F) const;
 
-  void setOrientation(const Orientation o) { orientation = o; }
+  void setOrientation(const Orientation o) {
+    if (orientation == o) return;
+    orientation = o;
+    ++restoreEpoch_;
+  }
   Orientation getOrientation() const { return orientation; }
 
   void setFadingFix(const bool enabled) { fadingFix = enabled; }
@@ -369,6 +375,7 @@ class GfxRenderer {
    public:
     explicit FrameBufferLoan(GfxRenderer& renderer);
     ~FrameBufferLoan() { end(); }
+    bool active() const { return active_; }
     void end();
     FrameBufferLoan(const FrameBufferLoan&) = delete;
     FrameBufferLoan& operator=(const FrameBufferLoan&) = delete;
