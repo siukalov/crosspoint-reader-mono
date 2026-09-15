@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile the production renderer and font stack against host hardware boundaries."""
 
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -13,6 +14,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 RENDERER = ROOT / "lib/GfxRenderer/GfxRenderer.cpp"
 GRAY_FRAME = ROOT / "lib/GfxRenderer/GrayFrame.h"
+READER_UTILS = ROOT / "src/activities/reader/ReaderUtils.h"
 
 STUBS = {
     "esp_heap_caps.h": r"""
@@ -63,7 +65,46 @@ class EInkDisplay {
   static constexpr uint16_t DISPLAY_HEIGHT = 480;
 };
 """,
-    "HalGPIO.h": "#pragma once\n",
+    "HalGPIO.h": "#pragma once\nstruct HostGpio { unsigned long lastTouchHeldMs() const { return 0; } }; inline HostGpio gpio;\n",
+    "HalTiltSensor.h": "#pragma once\nstruct HostTilt { bool wasTiltedForward() const { return false; } bool wasTiltedBack() const { return false; } }; inline HostTilt halTiltSensor;\n",
+    "CrossPointSettings.h": r"""
+#pragma once
+struct CrossPointSettings {
+  enum ORIENTATION { PORTRAIT, LANDSCAPE_CW, INVERTED, LANDSCAPE_CCW };
+  enum SHORT_PWRBTN { PAGE_TURN };
+  enum { OFF, READER_REFRESH_BALANCED };
+  int longPressButtonBehavior = OFF, shortPwrBtn = PAGE_TURN, readerRefreshMode = READER_REFRESH_BALANCED;
+  bool tiltPageTurn = false, touchReaderControls = false, backShortToFileBrowser = false;
+  int getRefreshFrequency() const { return 7; }
+};
+inline CrossPointSettings SETTINGS;
+""",
+    "MappedInputManager.h": r"""
+#pragma once
+struct MappedInputManager {
+  enum class Button { Right, Left, PageBack, PageForward, Power, Back };
+  bool isNavDirectionSwapped() const { return false; }
+  bool wasPressed(Button) const { return false; }
+  bool wasReleased(Button) const { return false; }
+  bool isPressed(Button) const { return false; }
+  bool hasTouch() const { return false; }
+  bool wasScreenTouchContact(int&, int&) const { return false; }
+  bool wasScreenTapped(int&, int&) const { return false; }
+  bool wasMenuGesture() const { return false; }
+  void suppressTouchTapOnce() const {}
+  unsigned long getHeldTime() const { return 0; }
+};
+""",
+    "activities/ActivityManager.h": "#pragma once\nstruct ActivityManager { void goToFileBrowser(const char*) {} };\n",
+    "components/bars/tap-zones.h": r"""
+#pragma once
+#include <cstdint>
+namespace freeink::ui {
+using ActionId = int;
+struct Rect { int16_t x, y, w, h; bool contains(int16_t, int16_t) const { return false; } };
+struct TapZone { Rect rect; ActionId action; bool enabled = true; };
+}
+""",
     "Logging.h": r"""
 #pragma once
 #include <Arduino.h>
@@ -112,6 +153,8 @@ HARNESS = r"""
 #include <FontCacheManager.h>
 #include <FontDecompressor.h>
 #include <esp_heap_caps.h>
+static void readerBoundary(const char*, GfxRenderer&);
+#include <ReaderUtils.h>
 
 static std::array<uint8_t, 48000> physical;
 static GfxRenderer* captureAbortRenderer = nullptr;
@@ -158,6 +201,10 @@ static std::vector<uint8_t*>& scratchChunks(GfxRenderer& renderer) {
 }
 static bool lent = false;
 static bool aborted = false;
+static bool allowDisplayCommit = true;
+static const char* readerAbortPoint = nullptr;
+static int readerBoundaryHits = 0;
+static bool graySawComplete = false;
 static int submissions = 0;
 static int graySubmissions = 0;
 static int baseSubmissions = 0;
@@ -179,6 +226,12 @@ static void require(bool condition, const char* name) {
     std::exit(1);
   }
 }
+static void readerBoundary(const char* point, GfxRenderer& renderer) {
+  if (readerAbortPoint && std::strcmp(readerAbortPoint, point) == 0) {
+    ++readerBoundaryHits;
+    renderer.abortDisplayWork();
+  }
+}
 HalDisplay::HalDisplay() = default;
 HalDisplay::~HalDisplay() = default;
 uint8_t* HalDisplay::getFrameBuffer() const { return lent ? nullptr : physical.data(); }
@@ -192,8 +245,8 @@ void HalDisplay::drawImage(const uint8_t* data, uint16_t x, uint16_t y, uint16_t
     for (unsigned byte = 0; byte < width / 8 && x / 8 + byte < 100; ++byte)
       physical[(y + row) * 100 + x / 8 + byte] = data[row * (width / 8) + byte];
 }
-void HalDisplay::displayBuffer(RefreshMode, bool) { ++submissions; }
-void HalDisplay::displayBufferAsync(RefreshMode) { ++submissions; ++asyncSubmissions; }
+void HalDisplay::displayBuffer(RefreshMode mode, bool) { lastFallback = mode; if (!aborted && allowDisplayCommit) ++submissions; }
+void HalDisplay::displayBufferAsync(RefreshMode mode) { lastFallback = mode; if (!aborted && allowDisplayCommit) { ++submissions; ++asyncSubmissions; } }
 void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool fading) {
   ++baseSubmissions; stagedB = physical; lastFallback = fallback; lastFadingFix = fading;
 }
@@ -213,14 +266,19 @@ void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* source) {
   }
   pendingCleanup = false;
 }
-void HalDisplay::displayGrayBuffer(bool fading) { ++graySubmissions; lastFadingFix = fading; }
+void HalDisplay::displayGrayBuffer(bool fading) {
+  if (!aborted && allowDisplayCommit) ++graySubmissions;
+  lastFadingFix = fading;
+  if (cleanupRenderer) graySawComplete = cleanupRenderer->liveFrameValid() &&
+      cleanupRenderer->getFrameOwner() == GfxRenderer::FrameOwner::ReaderBase && physical == stagedB;
+}
 bool HalDisplay::supportsAsyncRefresh() const { return true; }
 bool HalDisplay::refreshBusy() { return false; }
 void HalDisplay::waitRefreshComplete() {}
 void HalDisplay::beginDisplayWork() { ++workStarts; aborted = false; }
 void HalDisplay::abortPostRefresh() { aborted = true; }
 bool HalDisplay::postRefreshAborted() const { return aborted; }
-bool HalDisplay::displayCommitted() const { return !aborted; }
+bool HalDisplay::displayCommitted() const { return !aborted && allowDisplayCommit; }
 uint8_t* HalDisplay::lendFrameBufferStorage(uint32_t* size) {
   if (lent) return nullptr;
   lent = true;
@@ -2004,6 +2062,133 @@ static void testLegacySnapshots(HalDisplay& hal) {
   }
 }
 
+
+static void testReaderAntiAliased(HalDisplay& hal) {
+  const char* points[] = {nullptr,
+#ifdef READER_BOUNDARY_PROBES
+      "before_l", "after_l", "before_m", "after_m", "before_submit",
+#endif
+  };
+  for (bool retained : {true, false}) for (const char* point : points) {
+    GfxRenderer renderer(hal); renderer.begin(); renderer.beginDisplayWork();
+    renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+    if (retained) require(renderer.setUiGrayEnabled(true), "TXT enables retention");
+    renderer.clearScreen();
+    if (retained) {
+      require(renderer.drawCoverage(1, 2, 2), "TXT status marker");
+      require(renderer.drawCoverage(2, 2, 2), "TXT stale content marker");
+    } else renderer.drawPixel(1, 2);
+    const uint8_t* liveL = renderer.getLiveGrayPlane(true);
+    const uint8_t* liveM = renderer.getLiveGrayPlane(false);
+    {
+      GfxRenderer::ScopedTarget base(renderer, GfxRenderer::FrameOwner::ReaderBase);
+      renderer.fillRect(2, 2, 4, 1, false);
+      renderer.drawPixel(5, 2);
+    }
+    std::array<uint8_t, 48000> expectedB, expectedL{}, expectedM{};
+    expectedB.fill(0xFF); expectedB[200] = 0xBB;
+    expectedL[200] = retained ? 0x48 : 0x08;
+    expectedM[200] = retained ? 0x58 : 0x18;
+    int pages = 2, renders = 0;
+    const int commitsBefore = graySubmissions, binaryBefore = submissions, startsBefore = workStarts;
+    const int cleanupsBefore = cleanupCalls;
+    readerAbortPoint = point; readerBoundaryHits = 0;
+    cleanupRenderer = &renderer; graySawComplete = false;
+    const bool result = ReaderUtils::renderAntiAliased(renderer, pages, 2, 2, 4, 1, [&] {
+      ++renders;
+      require(renderer.getFrameOwner() == GfxRenderer::FrameOwner::ReaderScratch, "TXT callback owns scratch");
+      if (renderer.getRenderMode() == GfxRenderer::GRAYSCALE_MSB) renderer.drawPixel(3, 2, false);
+      renderer.drawPixel(4, 2, false);
+    });
+    require(renders == 2, "TXT production helper renders both selectors");
+    require(workStarts == startsBefore, "TXT helper preserves display generation");
+    require(renderer.getFrameOwner() == GfxRenderer::FrameOwner::LiveUi && renderer.getRenderMode() == GfxRenderer::BW,
+            "TXT restores caller ownership and mode");
+    expect(physical.data(), expectedB.data(), expectedB.size(), "TXT final literal B");
+    require(submissions == binaryBefore, "TXT AA does not submit binary fallback internally");
+    if (point) {
+      require(readerBoundaryHits == 1 && renderer.displayWorkAborted(), "TXT reaches exact cancellation boundary");
+      require(!result && pages == 2 && graySubmissions == commitsBefore, "TXT cancellation has no activation or countdown");
+      require(renderer.liveFrameNeedsRedraw() && cleanupCalls == cleanupsBefore, "TXT cancellation invalidates without terminal cleanup");
+      if (retained) {
+        if (std::strcmp(point, "before_l") == 0) expectedL[200] = 0x60;
+        if (std::strcmp(point, "before_l") == 0 || std::strcmp(point, "after_l") == 0 ||
+            std::strcmp(point, "before_m") == 0) expectedM[200] = 0x60;
+        expect(liveL, expectedL.data(), expectedL.size(), "TXT cancelled literal L preserves status");
+        expect(liveM, expectedM.data(), expectedM.size(), "TXT cancelled literal M preserves status");
+      }
+    } else {
+      require(result && renderer.liveFrameValid(), "TXT completed import commits");
+      require(pages == 1 && graySubmissions == commitsBefore + 1 && lastFallback == HalDisplay::FAST_REFRESH,
+              "TXT committed gray spends one refresh count");
+      require(graySawComplete && cleanupCalls == cleanupsBefore + 1, "TXT terminal submission sees restored B and ReaderBase");
+      expect(stagedB.data(), expectedB.data(), expectedB.size(), "TXT submitted literal B");
+      expect(stagedL.data(), expectedL.data(), expectedL.size(), "TXT submitted literal L");
+      expect(stagedM.data(), expectedM.data(), expectedM.size(), "TXT submitted literal M");
+      if (retained) {
+        expect(liveL, expectedL.data(), expectedL.size(), "TXT final literal L");
+        expect(liveM, expectedM.data(), expectedM.size(), "TXT final literal M");
+      }
+    }
+    readerAbortPoint = nullptr; cleanupRenderer = nullptr;
+  }
+}
+
+static void testReaderRefreshControls(HalDisplay& hal) {
+  for (bool retained : {true, false}) {
+    GfxRenderer renderer(hal); renderer.begin(); renderer.beginDisplayWork();
+    renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+    if (retained) require(renderer.setUiGrayEnabled(true), "TXT refresh enables retention");
+    renderer.clearScreen();
+    int pages = 2;
+    const int asynchronous = asyncSubmissions;
+    ReaderUtils::displayWithRefreshCycle(renderer, pages, true);
+    require(pages == 1 && asyncSubmissions == asynchronous + 1 && lastFallback == HalDisplay::FAST_REFRESH,
+            "TXT actual async refresh helper advances committed page");
+    ReaderUtils::displayWithRefreshCycle(renderer, pages);
+    require(pages == 7 && lastFallback == HalDisplay::FULL_REFRESH, "TXT actual full refresh resets configured cadence");
+    allowDisplayCommit = false;
+    ReaderUtils::displayWithRefreshCycle(renderer, pages);
+    require(pages == 7, "TXT rejected refresh preserves countdown");
+    allowDisplayCommit = true;
+    const int startsBefore = workStarts, activationsBefore = submissions + graySubmissions;
+    renderer.abortDisplayWork();
+    int renders = 0;
+    require(!ReaderUtils::renderAntiAliased(renderer, pages, 2, 2, 4, 1, [&] { ++renders; }), "TXT prior abort rejected");
+    ReaderUtils::displayWithRefreshCycle(renderer, pages, true);
+    require(renders == 0 && pages == 7 && startsBefore == workStarts && activationsBefore == submissions + graySubmissions,
+            "TXT prior abort does not restart generation or consume refresh");
+
+    renderer.beginDisplayWork(); renderer.clearScreen();
+    if (retained) require(renderer.drawCoverage(1, 2, 2), "TXT allocation failure status marker");
+    else renderer.drawPixel(1, 2);
+    const auto before = physical;
+    const int commitsBefore = submissions + graySubmissions;
+    failScratchAllocation = scratchAllocationCalls + 1;
+    require(!ReaderUtils::renderAntiAliased(renderer, pages, 2, 2, 4, 1, [&] { ++renders; }), "TXT allocation failure requests caller redraw");
+    failScratchAllocation = 0;
+    expect(physical.data(), before.data(), before.size(), "TXT allocation failure preserves B");
+    require(renders == 0 && pages == 7 && commitsBefore == submissions + graySubmissions && !renderer.displayWorkAborted(),
+            "TXT allocation failure neither commits nor cancels caller generation");
+    require(!retained || renderer.liveFrameNeedsRedraw(), "TXT retained allocation failure requires full caller redraw");
+
+    renderer.beginDisplayWork(); renderer.clearScreen();
+    allowDisplayCommit = false;
+    require(!ReaderUtils::renderAntiAliased(renderer, pages, 2, 2, 4, 1, [&] { renderer.drawPixel(4, 2, false); }),
+            "TXT rejected final gray reports no commit");
+    require(pages == 7 && commitsBefore == submissions + graySubmissions, "TXT rejected final gray preserves countdown");
+    allowDisplayCommit = true;
+  }
+  GfxRenderer renderer(hal); renderer.begin(); renderer.beginDisplayWork();
+  failAllocation = allocationCalls + 1;
+  require(!renderer.setUiGrayEnabled(true), "TXT retention allocation failure remains disabled");
+  failAllocation = 0; renderer.clearScreen();
+  int pages = 1, renders = 0;
+  require(ReaderUtils::renderAntiAliased(renderer, pages, 2, 2, 4, 1, [&] { ++renders; renderer.drawPixel(4, 2, false); }),
+          "TXT disabled retention preserves legacy AA");
+  require(renders == 2 && pages == 7 && !renderer.uiGrayEnabled(), "TXT disabled retention reports actual policy and cadence");
+}
+
 int main() {
   HalDisplay hal;
   {
@@ -2085,6 +2270,8 @@ int main() {
   testLegacySnapshots(hal);
   testReaderScratchOwnership(hal);
   testReaderScratchImport(hal);
+  testReaderAntiAliased(hal);
+  testReaderRefreshControls(hal);
   std::puts("PASS: actual renderer ownership, submission, imports, glyphs, opaque writers, image clipping and stale target controls");
   }
   require(liveAllocations == 0, "renderer destruction releases pair");
@@ -2314,13 +2501,14 @@ class RendererSeamTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="gfx-gray-") as name:
             work = Path(name)
             for filename, content in STUBS.items():
+                (work / filename).parent.mkdir(parents=True, exist_ok=True)
                 (work / filename).write_text(content)
             harness = work / "harness.cpp"
             harness.write_text(HARNESS)
             cxx = shlex.split(os.environ.get("CXX", "clang++"))
             cc = shlex.split(os.environ.get("CC", "clang"))
-            includes = [f"-I{work}", *(f"-I{ROOT / path}" for path in INCLUDES)]
-            common = ["-O1", "-g", "-fno-builtin-memcpy", "-ffunction-sections", "-fdata-sections", *includes]
+            includes = [f"-I{work}", f"-I{READER_UTILS.parent}", *(f"-I{ROOT / path}" for path in INCLUDES)]
+            common = ["-O1", "-g", "-DFREEINK_DEVICE_PAPERMONO=1", "-fno-builtin-memcpy", "-ffunction-sections", "-fdata-sections", *includes]
             objects = []
             sources = [RENDERER, *(ROOT / path for path in CPP_SOURCES), harness]
             sources += sorted((ROOT / "lib/uzlib/src").glob("*.c"))
@@ -2336,8 +2524,31 @@ class RendererSeamTest(unittest.TestCase):
             dead_strip = "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections"
             subprocess.run([*cxx, dead_strip, *objects, "-o", str(binary)], check=True)
 
+            subprocess.run([str(binary)], check=True)
+            reader_source = READER_UTILS.read_text()
+            print("ReaderUtils SHA256:", hashlib.sha256(reader_source.encode()).hexdigest(), flush=True)
+            observed = reader_source
+            for call, before, after in [
+                ("renderer.copyGrayscaleLsbBuffers();", "before_l", "after_l"),
+                ("renderer.copyGrayscaleMsbBuffers();", "before_m", "after_m"),
+                ("renderer.displayGrayBuffer();", "before_submit", None),
+            ]:
+                self.assertEqual(observed.count(call), 1, f"reader observer anchor changed: {call}")
+                wrapped = f'readerBoundary("{before}", renderer); {call}'
+                if after:
+                    wrapped += f' readerBoundary("{after}", renderer);'
+                observed = observed.replace(call, wrapped)
+            (work / "ReaderUtils.h").write_text(observed)
+            reader_object = work / "reader-probes.o"
+            reader_binary = work / "reader-probes"
+            subprocess.run([*cxx, "-std=c++17", *common, "-DREADER_BOUNDARY_PROBES", "-c", str(harness), "-o", str(reader_object)], check=True)
+            reader_objects = objects.copy()
+            reader_objects[1 + len(CPP_SOURCES)] = str(reader_object)
+            subprocess.run([*cxx, dead_strip, *reader_objects, "-o", str(reader_binary)], check=True)
+            subprocess.run([str(reader_binary)], check=True)
+            (work / "ReaderUtils.h").unlink()
+
             if os.environ.get("GFX_GRAY_BASELINE_ONLY"):
-                subprocess.run([str(binary)], check=True)
                 return
 
             source = RENDERER.read_text()
@@ -2458,6 +2669,39 @@ class RendererSeamTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, "stale direct writer mutant survived")
                 self.assertIn(expected_error, result.stderr)
                 print("EXPECTED MUTANT FAILURE:", result.stderr.strip())
+            (work / "DirectPixelWriter.h").unlink()
+            reader_mutants = [
+                ("TXT scratch ownership", "FrameOwner::ReaderScratch", "FrameOwner::LiveUi",
+                 "TXT production helper renders both selectors: expected true, actual false"),
+                ("TXT full-plane imports", "renderer.beginReaderImport(x, y, width, height)",
+                 "renderer.beginReaderImport(0, 0, renderer.getScreenWidth(), renderer.getScreenHeight())",
+                 "TXT submitted literal L: byte 200 expected 48, actual 08"),
+                ("TXT missing L", "renderer.copyGrayscaleLsbBuffers();", "(void)renderer;",
+                 "TXT completed import commits: expected true, actual false"),
+                ("TXT missing M", "renderer.copyGrayscaleMsbBuffers();", "(void)renderer;",
+                 "TXT completed import commits: expected true, actual false"),
+                ("TXT missing B restoration", "if (!renderer.restoreReaderBwScratch() || renderer.displayWorkAborted()) return false;",
+                 "if (renderer.displayWorkAborted()) return false;", "TXT final literal B: byte 200 expected BB, actual 9B"),
+                ("TXT omitted gray activation", "renderer.displayGrayBuffer();", "(void)renderer;",
+                 "TXT committed gray spends one refresh count: expected true, actual false"),
+                ("TXT reset generation", "if (renderer.displayWorkAborted() || !renderer.liveFrameValid()) return false;",
+                 "renderer.beginDisplayWork(); if (!renderer.liveFrameValid()) return false;",
+                 "TXT helper preserves display generation: expected true, actual false"),
+                ("TXT unconditional gray countdown", "if (committed) advanceRefreshCycle(pagesUntilFullRefresh);",
+                 "advanceRefreshCycle(pagesUntilFullRefresh);", "TXT cancellation has no activation or countdown: expected true, actual false"),
+                ("TXT unconditional refresh countdown", "if (renderer.displayCommitted()) advanceRefreshCycle(pagesUntilFullRefresh);",
+                 "advanceRefreshCycle(pagesUntilFullRefresh);", "TXT rejected refresh preserves countdown: expected true, actual false"),
+            ]
+            for name, original, replacement, expected_error in reader_mutants:
+                self.assertEqual(observed.count(original), 1, f"{name} mutant anchor changed")
+                (work / "ReaderUtils.h").write_text(observed.replace(original, replacement))
+                subprocess.run([*cxx, "-std=c++17", *common, "-DREADER_BOUNDARY_PROBES", "-c", str(harness), "-o", str(reader_object)], check=True)
+                subprocess.run([*cxx, dead_strip, *reader_objects, "-o", str(reader_binary)], check=True)
+                result = subprocess.run([str(reader_binary)], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, f"{name} mutant survived")
+                self.assertIn(expected_error, result.stderr)
+                print("EXPECTED MUTANT FAILURE:", result.stderr.strip())
+            self.assertEqual(READER_UTILS.read_text(), reader_source, "production ReaderUtils changed during test")
             self.assertEqual(RENDERER.read_text(), source, "production source changed during test")
             subprocess.run([str(binary)], check=True)
 
