@@ -171,6 +171,7 @@ class GfxRenderer {
   FrameResult captureRegion(int x, int y, int width, int height, GrayFrame::Plane storage, FrameSnapshot& out) const;
   FrameResult captureFrame(GrayFrame::Plane storage, FrameSnapshot& out) const;
   FrameResult restoreRegion(const FrameSnapshot& source) const;
+  FrameResult replaceFrame(const FrameSnapshot& source) const;
   const uint8_t* getLiveGrayPlane(bool lsb) const {
     return uiGrayEnabled_ && canCaptureLiveFrame() ? (lsb ? liveL_ : liveM_) : nullptr;
   }

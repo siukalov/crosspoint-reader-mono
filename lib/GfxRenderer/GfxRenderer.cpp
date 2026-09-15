@@ -2015,6 +2015,28 @@ GfxRenderer::FrameResult GfxRenderer::restoreRegion(const FrameSnapshot& source)
   return accountCancellation() ? FrameResult::PublishedCancelled : FrameResult::Ok;
 }
 
+GfxRenderer::FrameResult GfxRenderer::replaceFrame(const FrameSnapshot& source) const {
+  if (!frameBuffer || target_.strip || target_.owner != FrameOwner::LiveUi) return FrameResult::Unavailable;
+  if (display.postRefreshAborted()) return FrameResult::Cancelled;
+  const auto validation = validateSnapshot(source);
+  if (validation != FrameResult::Ok) return validation;
+  if (source.planes.width() != panelWidth || source.planes.rows() != panelHeight) return FrameResult::GeometryMismatch;
+  if (display.postRefreshAborted()) return FrameResult::Cancelled;
+
+  const uint8_t* sources[] = {source.planes.b().data, source.planes.l().data, source.planes.m().data};
+  uint8_t* destinations[] = {frameBuffer, liveL_, liveM_};
+  const size_t bytes = source.planes.stride() * source.planes.rows();
+  for (size_t plane = 0; plane < (uiGrayEnabled_ ? 3u : 1u); ++plane) {
+    memcpy(destinations[plane], sources[plane], bytes);
+  }
+  ++targetGeneration_;
+  readerImport_ = {};
+  if (accountCancellation()) return FrameResult::PublishedCancelled;
+  ++restoreEpoch_;
+  liveCoherent_ = true;
+  return FrameResult::Ok;
+}
+
 size_t GfxRenderer::readFramebufferRegion(int x, int y, int w, int h, uint8_t* dst, size_t dstCapacity) const {
   if (!canCaptureLiveFrame() || dst == nullptr || w <= 0 || h <= 0) return 0;
 

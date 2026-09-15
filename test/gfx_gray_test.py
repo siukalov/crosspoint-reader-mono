@@ -120,6 +120,7 @@ static int captureAbortHits = 0;
 static const uint8_t* restoreAbortL = nullptr;
 static const uint8_t* restoreAbortM = nullptr;
 static bool restoreAbortSawMixed = false;
+static size_t restoreAbortBytes = 1;
 extern "C" void* memcpy(void* destination, const void* source, size_t size)
     noexcept(noexcept(std::memcpy(destination, source, size))) {
   void* result = std::memmove(destination, source, size);
@@ -127,9 +128,12 @@ extern "C" void* memcpy(void* destination, const void* source, size_t size)
     GfxRenderer* renderer = captureAbortRenderer;
     captureAbortRenderer = nullptr;
     ++captureAbortHits;
-    if (restoreAbortL && restoreAbortM)
-      restoreAbortSawMixed = *static_cast<uint8_t*>(destination) == 0xCC &&
-                             *restoreAbortL == 0x11 && *restoreAbortM == 0x55;
+    if (restoreAbortL && restoreAbortM) {
+      restoreAbortSawMixed = size == restoreAbortBytes;
+      for (size_t i = 0; i < restoreAbortBytes; ++i)
+        restoreAbortSawMixed &= static_cast<uint8_t*>(destination)[i] == 0xCC &&
+                                restoreAbortL[i] == 0x11 && restoreAbortM[i] == 0x55;
+    }
     renderer->abortDisplayWork();
   }
   return result;
@@ -140,6 +144,8 @@ static int submissions = 0;
 static int graySubmissions = 0;
 static int baseSubmissions = 0;
 static int asyncSubmissions = 0;
+static int grayCopies = 0;
+static int workStarts = 0;
 static HalDisplay::RefreshMode lastFallback = HalDisplay::FAST_REFRESH;
 static bool lastFadingFix = false;
 static std::array<uint8_t, 48000> stagedB{}, stagedL{}, stagedM{};
@@ -167,8 +173,8 @@ void HalDisplay::displayBufferAsync(RefreshMode) { ++submissions; ++asyncSubmiss
 void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool fading) {
   ++baseSubmissions; stagedB = physical; lastFallback = fallback; lastFadingFix = fading;
 }
-void HalDisplay::copyGrayscaleLsbBuffers(const uint8_t* source) { std::memcpy(stagedL.data(), source, 48000); }
-void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* source) { std::memcpy(stagedM.data(), source, 48000); }
+void HalDisplay::copyGrayscaleLsbBuffers(const uint8_t* source) { ++grayCopies; std::memcpy(stagedL.data(), source, 48000); }
+void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* source) { ++grayCopies; std::memcpy(stagedM.data(), source, 48000); }
 void HalDisplay::writeGrayscalePlaneStrip(bool lsb, const uint8_t* source, uint16_t y, uint16_t rows) {
   std::memcpy((lsb ? stagedL : stagedM).data() + y * 100, source, rows * 100);
 }
@@ -176,7 +182,7 @@ void HalDisplay::displayGrayBuffer(bool fading) { ++graySubmissions; lastFadingF
 bool HalDisplay::supportsAsyncRefresh() const { return true; }
 bool HalDisplay::refreshBusy() { return false; }
 void HalDisplay::waitRefreshComplete() {}
-void HalDisplay::beginDisplayWork() { aborted = false; }
+void HalDisplay::beginDisplayWork() { ++workStarts; aborted = false; }
 void HalDisplay::abortPostRefresh() { aborted = true; }
 bool HalDisplay::postRefreshAborted() const { return aborted; }
 bool HalDisplay::displayCommitted() const { return !aborted; }
@@ -1549,6 +1555,215 @@ static void testRegionSnapshots(HalDisplay& hal) {
   reject(snapshot, Result::PolicyMismatch, "restore tuple under BW policy rejected");
 }
 
+
+static void testFrameReplacement(HalDisplay& hal) {
+  using Result = GfxRenderer::FrameResult;
+  using Snapshot = GfxRenderer::FrameSnapshot;
+  GfxRenderer renderer(hal);
+  renderer.begin(); renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+  require(renderer.setUiGrayEnabled(true), "replacement enables retained tuple");
+  renderer.clearScreen();
+  const auto live = renderer.getWriteTuple();
+  std::array<uint8_t, 144002> storage;
+  storage.fill(0xA5);
+  std::memset(storage.data() + 1, 0xCC, 48000);
+  std::memset(storage.data() + 48001, 0x22, 48000);
+  std::memset(storage.data() + 96001, 0x66, 48000);
+  const auto original = storage;
+  Snapshot source;
+  source.planes = GrayFrame({storage.data() + 1, 48000}, {storage.data() + 48001, 48000},
+                           {storage.data() + 96001, 48000}, 800, 480, 100);
+  source.panelWidth = 800; source.panelHeight = 480; source.panelStride = 100;
+  source.orientation = GfxRenderer::LandscapeCounterClockwise;
+  source.kind = GfxRenderer::SnapshotKind::RetainedTuple;
+  source.restoreEpoch = UINT64_MAX; source.valid = true;
+  auto seedOld = [&]() {
+    std::memset(live.b().data, 0x33, 48000);
+    std::memset(live.l().data, 0x44, 48000);
+    std::memset(live.m().data, 0x66, 48000);
+  };
+  auto expectPublished = [&]() {
+    expect(live.b().data, original.data() + 1, 48000, "replacement complete B");
+    expect(live.l().data, original.data() + 48001, 48000, "replacement complete L");
+    expect(live.m().data, original.data() + 96001, 48000, "replacement complete M");
+  };
+  auto halActivity = [&]() { return submissions + graySubmissions + baseSubmissions + grayCopies + workStarts; };
+  auto reject = [&](const Snapshot& candidate, Result result, const char* name) {
+    std::array<uint8_t, 144000> before;
+    std::memcpy(before.data(), live.b().data, 48000);
+    std::memcpy(before.data() + 48000, live.l().data, 48000);
+    std::memcpy(before.data() + 96000, live.m().data, 48000);
+    const int calls = halActivity();
+    require(renderer.replaceFrame(candidate) == result, name);
+    expect(live.b().data, before.data(), 48000, "rejected replacement preserves B");
+    expect(live.l().data, before.data() + 48000, 48000, "rejected replacement preserves L");
+    expect(live.m().data, before.data() + 96000, 48000, "rejected replacement preserves M");
+    expect(storage.data(), original.data(), storage.size(), "replacement preserves source and canaries");
+    require(halActivity() == calls, "rejected replacement has no HAL activity");
+  };
+  seedOld();
+  Snapshot region, current;
+  std::array<uint8_t, 3> regionStorage{}, currentStorage{};
+  require(renderer.captureRegion(0, 0, 8, 1, {regionStorage.data(), 3}, region) == Result::Ok,
+          "replacement captures old region epoch");
+  DirectPixelWriter stale;
+  stale.init(renderer); stale.beginRow(0);
+  const auto generation = renderer.getTargetGeneration();
+  const int before = halActivity();
+  require(renderer.replaceFrame(source) == Result::Ok, "complete replacement accepted");
+  expectPublished();
+  require(renderer.liveFrameValid() && renderer.getTargetGeneration() == generation + 1,
+          "replacement publishes coherence and invalidates writers");
+  stale.writePixel(0, 0);
+  expectPublished();
+  require(renderer.restoreRegion(region) == Result::InvalidLive, "replacement invalidates old region epoch");
+  require(renderer.captureRegion(0, 0, 8, 1, {currentStorage.data(), 3}, current) == Result::Ok &&
+          current.restoreEpoch == region.restoreEpoch + 1, "replacement advances region epoch once");
+  require(halActivity() == before, "replacement makes no HAL call or new generation");
+  std::memset(storage.data() + 1, 0, 144000);
+  expectPublished();
+  storage = original;
+  renderer.displayBuffer();
+  require(halActivity() == before + 4, "explicit display submits complete replacement");
+  expect(stagedB.data(), original.data() + 1, 48000, "replacement submitted B");
+  expect(stagedL.data(), original.data() + 48001, 48000, "replacement submitted L");
+  expect(stagedM.data(), original.data() + 96001, 48000, "replacement submitted M");
+
+  seedOld();
+  Snapshot bad = source; bad.valid = false;
+  reject(bad, Result::InvalidSource, "replacement invalid slot rejected");
+  bad = source; bad.kind = static_cast<GfxRenderer::SnapshotKind>(99);
+  reject(bad, Result::InvalidSource, "replacement unknown kind rejected");
+  bad = source; bad.kind = GfxRenderer::SnapshotKind::LegacyBw;
+  reject(bad, Result::PolicyMismatch, "replacement BW under tuple policy rejected");
+  for (int plane = 0; plane < 3; ++plane) {
+    GrayFrame::Plane views[] = {source.planes.b(), source.planes.l(), source.planes.m()};
+    views[plane].capacity = 47999;
+    bad = source; bad.planes = GrayFrame(views[0], views[1], views[2], 800, 480, 100);
+    reject(bad, Result::ShortCapacity, "replacement short source rejected");
+    views[plane] = {nullptr, 48000};
+    bad.planes = GrayFrame(views[0], views[1], views[2], 800, 480, 100);
+    reject(bad, Result::InvalidSource, "replacement missing source rejected");
+    for (auto destination : {live.b().data, live.l().data, live.m().data}) {
+      views[plane] = {destination + 17, 48000};
+      bad.planes = GrayFrame(views[0], views[1], views[2], 800, 480, 100);
+      reject(bad, Result::InvalidSource, "replacement offset alias rejected");
+    }
+  }
+  bad = source;
+  bad.planes = GrayFrame(source.planes.b(), {source.planes.b().data + 17, 48000}, source.planes.m(), 800, 480, 100);
+  reject(bad, Result::InvalidSource, "replacement overlapping source planes rejected");
+  for (int field = 0; field < 4; ++field) {
+    bad = source;
+    if (field == 0) --bad.panelWidth;
+    if (field == 1) --bad.panelHeight;
+    if (field == 2) --bad.panelStride;
+    if (field == 3) bad.orientation = GfxRenderer::Portrait;
+    reject(bad, Result::GeometryMismatch, "replacement saved geometry rejected");
+  }
+  const size_t partial[][5] = {{792, 480, 99, 0, 0}, {800, 479, 100, 0, 0},
+                              {792, 480, 99, 0, 1}, {800, 479, 100, 1, 0}};
+  for (const auto& dimensions : partial) {
+    bad = source; bad.physicalByteX = dimensions[4];
+    bad.planes = GrayFrame(source.planes.b(), source.planes.l(), source.planes.m(),
+                          dimensions[0], dimensions[1], dimensions[2], dimensions[3]);
+    reject(bad, Result::GeometryMismatch, "replacement requires full physical coverage");
+  }
+  renderer.abortDisplayWork();
+  reject(source, Result::Cancelled, "pre-cancelled replacement rejected");
+  require(renderer.liveFrameValid(), "rejected cancellation does not invalidate live");
+  renderer.beginDisplayWork();
+  require(renderer.liveFrameNeedsRedraw() && renderer.replaceFrame(source) == Result::Ok,
+          "fresh replacement repairs accounted live cancellation");
+
+  std::array<uint8_t, 300> offscreen{};
+  for (auto owner : {GfxRenderer::FrameOwner::ReaderBase, GfxRenderer::FrameOwner::ReaderScratch}) {
+    GfxRenderer::ScopedTarget scope(renderer, owner);
+    reject(source, Result::Unavailable, "reader owner rejects replacement");
+  }
+  require(renderer.liveFrameNeedsRedraw() && renderer.restoreRegion(current) == Result::InvalidLive,
+          "region cannot repair scratch invalidity");
+  renderer.beginDisplayWork();
+  require(renderer.replaceFrame(source) == Result::Ok && renderer.liveFrameValid(),
+          "replacement repairs scratch invalidity");
+  expectPublished();
+  {
+    GfxRenderer::ScopedTarget scope(renderer, offscreen.data(), 0, 1);
+    reject(source, Result::Unavailable, "strip rejects replacement");
+  }
+  for (bool inputAbort : {false, true}) {
+    bool coherent = true;
+    {
+      GrayFrame slot({offscreen.data(), 100}, {offscreen.data() + 100, 100},
+                     {offscreen.data() + 200, 100}, 800, 1, 100);
+      GfxRenderer::ScopedTarget scope(renderer, slot, coherent);
+      require(scope.active(), "publication offscreen scope active");
+      reject(source, Result::Unavailable, "offscreen scope rejects replacement");
+      if (inputAbort) renderer.abortDisplayWork(); else scope.cancel();
+    }
+    require(!coherent, "cancelled offscreen slot invalid");
+    bad = source; bad.valid = coherent;
+    reject(bad, inputAbort ? Result::Cancelled : Result::InvalidSource,
+           "cancelled offscreen slot publication rejected");
+    require(renderer.liveFrameValid(), "cancelled offscreen publication preserves live validity");
+    renderer.beginDisplayWork();
+  }
+  {
+    GfxRenderer::FrameBufferLoan outer(renderer), inner(renderer);
+    require(outer.active() && !inner.active(), "replacement loan is single owner");
+    inner.end();
+    reject(source, Result::Unavailable, "loan rejects replacement");
+    require(!renderer.hasFrameBuffer(), "replacement does not return outer loan");
+    outer.end();
+  }
+  require(renderer.liveFrameNeedsRedraw() && renderer.restoreRegion(current) == Result::InvalidLive,
+          "region cannot repair loan invalidity");
+  renderer.beginDisplayWork();
+  require(renderer.replaceFrame(source) == Result::Ok && renderer.liveFrameValid(),
+          "replacement repairs loan invalidity despite saved epoch");
+  expectPublished();
+
+  seedOld();
+  std::memset(live.l().data, 0x11, 48000);
+  std::memset(live.m().data, 0x55, 48000);
+  restoreAbortL = live.l().data; restoreAbortM = live.m().data; restoreAbortBytes = 48000;
+  captureAbortDestination = live.b().data;
+  captureAbortHits = 0; restoreAbortSawMixed = false; captureAbortRenderer = &renderer;
+  const int beforeAbort = halActivity();
+  require(renderer.replaceFrame(source) == Result::PublishedCancelled, "late replacement reports PublishedCancelled");
+  require(captureAbortHits == 1 && restoreAbortSawMixed,
+          "replacement abort sees full new B and all old selectors exactly once");
+  expectPublished();
+  require(renderer.liveFrameNeedsRedraw(), "late replacement invalidates live");
+  renderer.displayBuffer();
+  require(halActivity() == beforeAbort, "late replacement and display make no HAL call");
+  restoreAbortL = restoreAbortM = nullptr; restoreAbortBytes = 1;
+  renderer.beginDisplayWork();
+  require(renderer.replaceFrame(source) == Result::Ok, "fresh replacement recovers late cancellation");
+  const int beforeDisplay = halActivity();
+  renderer.abortDisplayWork(); renderer.displayBuffer();
+  require(halActivity() == beforeDisplay && renderer.liveFrameNeedsRedraw() && !renderer.displayCommitted(),
+          "abort after replacement Ok suppresses display");
+  expectPublished();
+  expect(storage.data(), original.data(), storage.size(), "cancelled replacement preserves source");
+
+  renderer.beginDisplayWork();
+  require(renderer.setUiGrayEnabled(false), "replacement disables retained policy");
+  renderer.clearScreen();
+  reject(source, Result::PolicyMismatch, "replacement tuple under BW policy rejected");
+  Snapshot legacy = source; legacy.kind = GfxRenderer::SnapshotKind::LegacyBw;
+  legacy.planes = GrayFrame(source.planes.b(), {}, {}, 800, 480, 100);
+  seedOld();
+  const int beforeLegacy = halActivity();
+  require(renderer.replaceFrame(legacy) == Result::Ok && renderer.liveFrameValid(),
+          "replacement accepts declared BW without selectors");
+  expect(live.b().data, original.data() + 1, 48000, "legacy replacement complete B");
+  for (size_t i = 0; i < 48000; ++i)
+    require(live.l().data[i] == 0x44 && live.m().data[i] == 0x66, "legacy replacement preserves unused selectors");
+  require(halActivity() == beforeLegacy, "legacy replacement makes no HAL call");
+}
+
 int main() {
   HalDisplay hal;
   {
@@ -1626,6 +1841,7 @@ int main() {
   testOpaqueWriters(hal);
   testSnapshots(hal);
   testRegionSnapshots(hal);
+  testFrameReplacement(hal);
   std::puts("PASS: actual renderer ownership, submission, imports, glyphs, opaque writers, image clipping and stale target controls");
   }
   require(liveAllocations == 0, "renderer destruction releases pair");
@@ -1938,6 +2154,18 @@ class RendererSeamTest(unittest.TestCase):
                  "void GfxRenderer::FrameBufferLoan::end() {", "nested loan cannot restore outer storage: expected true, actual false"),
                 ("accept restore offset alias", "if (addressRangesOverlap(sources[other].data, sourceBytes, destinations[plane], destinationBytes))",
                  "if (sources[other].data == destinations[plane])", "restore offset alias rejected: expected true, actual false"),
+            ]
+            mutants += [
+                ("publish invalid slot",
+                 "if (display.postRefreshAborted()) return FrameResult::Cancelled; const auto validation = validateSnapshot(source);",
+                 "if (display.postRefreshAborted()) return FrameResult::Cancelled; auto accepted = source; accepted.valid = true; const auto validation = validateSnapshot(accepted);",
+                 "replacement invalid slot rejected: expected true, actual false"),
+                ("publish only B", "for (size_t plane = 0; plane < (uiGrayEnabled_ ? 3u : 1u); ++plane)",
+                 "for (size_t plane = 0; plane < 1; ++plane)",
+                 "replacement complete L: byte 0 expected 22, actual 44"),
+                ("abort publication between planes", "memcpy(destinations[plane], sources[plane], bytes);",
+                 "memcpy(destinations[plane], sources[plane], bytes); if (accountCancellation()) return FrameResult::PublishedCancelled;",
+                 "replacement complete L: byte 0 expected 22, actual 11"),
             ]
             for name, original, replacement, expected_error in mutants:
                 pattern = r"\s+".join(re.escape(part) for part in original.split())
