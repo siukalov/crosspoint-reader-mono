@@ -33,8 +33,10 @@ class HalStorage {
   HalFile open(const char* path, const oflag_t oflag = O_RDONLY);
   bool mkdir(const char* path, const bool pFlag = true);
   bool exists(const char* path);
+  bool exists(const char* path, bool& result);
   bool remove(const char* path);
   bool rename(const char* oldPath, const char* newPath);
+  bool renameNoReplace(const char* oldPath, const char* newPath);
   bool rmdir(const char* path);
 
   bool openFileForRead(const char* moduleName, const char* path, HalFile& file);
@@ -73,6 +75,7 @@ class HalFile : public Print {
   HalFile& operator=(const HalFile&) = delete;
 
   void flush();
+  bool sync();
   size_t getName(char* name, size_t len);
   size_t size();
   size_t fileSize();
