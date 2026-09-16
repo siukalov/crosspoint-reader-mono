@@ -45,6 +45,9 @@ add_test(NAME mapped_input
 add_test(NAME gfx_gray
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/gfx_gray_test.py
 )
+add_test(NAME sleep_frame
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/sleep_frame_test.py
+)
 add_test(NAME ui_font_assets
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ui_font_assets_test.py
 )
@@ -67,7 +70,7 @@ add_test(NAME usb_file_transfer
 add_test(NAME usb_serial_transport
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/usb_serial_transport/run.sh
 )
-set_tests_properties(mapped_input gfx_gray panel_diagnostic panel_transition usb_file_transfer usb_serial_transport PROPERTIES
+set_tests_properties(mapped_input gfx_gray sleep_frame panel_diagnostic panel_transition usb_file_transfer usb_serial_transport PROPERTIES
   ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
 )
 
