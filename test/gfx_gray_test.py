@@ -210,6 +210,11 @@ static int graySubmissions = 0;
 static int baseSubmissions = 0;
 static int asyncSubmissions = 0;
 static int grayCopies = 0;
+static int calibrationCalls = 0;
+static GfxRenderer* grayCopyAbortRenderer = nullptr;
+static bool grayCopyAbortLsb = false;
+static std::array<uint16_t, 4> calibrationRect{};
+static std::array<uint8_t, 48000> calibrationL{}, calibrationM{};
 static int workStarts = 0;
 static int cleanupCalls = 0;
 static int cleanupSubmissions = 0;
@@ -250,8 +255,19 @@ void HalDisplay::displayBufferAsync(RefreshMode mode) { lastFallback = mode; if 
 void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool fading) {
   ++baseSubmissions; stagedB = physical; lastFallback = fallback; lastFadingFix = fading;
 }
-void HalDisplay::copyGrayscaleLsbBuffers(const uint8_t* source) { ++grayCopies; std::memcpy(stagedL.data(), source, 48000); }
-void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* source) { ++grayCopies; std::memcpy(stagedM.data(), source, 48000); }
+void HalDisplay::copyGrayscaleLsbBuffers(const uint8_t* source) {
+  ++grayCopies; std::memcpy(stagedL.data(), source, 48000);
+  if (grayCopyAbortRenderer && grayCopyAbortLsb) grayCopyAbortRenderer->abortDisplayWork();
+}
+void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* source) {
+  ++grayCopies; std::memcpy(stagedM.data(), source, 48000);
+  if (grayCopyAbortRenderer && !grayCopyAbortLsb) grayCopyAbortRenderer->abortDisplayWork();
+}
+void HalDisplay::displayGrayCalibration(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
+  ++calibrationCalls;
+  calibrationRect = {x, y, width, height};
+  calibrationL = stagedL; calibrationM = stagedM;
+}
 void HalDisplay::writeGrayscalePlaneStrip(bool lsb, const uint8_t* source, uint16_t y, uint16_t rows) {
   std::memcpy((lsb ? stagedL : stagedM).data() + y * 100, source, rows * 100);
 }
@@ -1198,6 +1214,96 @@ static void testOpaqueWriters(HalDisplay& hal) {
   testWriterOwnerControls(renderer);
 }
 
+
+static void testCalibrationSubmission(HalDisplay& hal) {
+  using Owner = GfxRenderer::FrameOwner;
+  GfxRenderer renderer(hal); renderer.begin(); renderer.beginDisplayWork();
+  renderer.setOrientation(GfxRenderer::Portrait);
+  require(renderer.setUiGrayEnabled(true), "calibration enables retention");
+  renderer.clearScreen();
+  require(renderer.drawCoverage(1, 3, 2), "calibration outside-row marker");
+  const auto savedB = physical;
+  stagedL.fill(0); stagedM.fill(0);
+  std::array<uint8_t, 35000> sourceL{}, sourceM{};
+  sourceL[18] = 0x80; sourceM[18] = 0x40;
+  {
+    GfxRenderer::ScopedTarget scratch(renderer, Owner::ReaderScratch);
+    require(renderer.beginReaderImport(55, 144, 350, 320), "calibration content import clip");
+    require(renderer.importReaderPlane(true, sourceL.data(), sourceL.size(), 75, 350) &&
+            renderer.importReaderPlane(false, sourceM.data(), sourceM.size(), 75, 350) &&
+            renderer.restoreReaderBase(savedB.data(), savedB.size(), 0, 480) && renderer.finishReaderImport(),
+            "calibration clipped import completes");
+  }
+  require(renderer.getLiveGrayPlane(true)[47800] == 0x10 && renderer.getLiveGrayPlane(false)[47800] == 0x10 &&
+          stagedL[47800] == 0 && stagedM[47800] == 0 && stagedL[7518] == 0x80 && stagedM[7518] == 0x40,
+          "calibration clipped staging omits retained outside row");
+  std::array<uint8_t, 48000> expectedL{}, expectedM{};
+  expectedL[47800] = expectedM[47800] = 0x10;
+  expectedL[7518] = 0x80; expectedM[7518] = 0x40;
+  const int callsBefore = calibrationCalls, copiesBefore = grayCopies;
+  const int grayBefore = graySubmissions, baseBefore = baseSubmissions, binaryBefore = submissions;
+  {
+    GfxRenderer::ScopedTarget base(renderer, Owner::ReaderBase);
+    renderer.displayGrayCalibration(55, 144, 350, 320);
+  }
+  expect(calibrationL.data(), expectedL.data(), expectedL.size(), "calibration terminal complete L");
+  expect(calibrationM.data(), expectedM.data(), expectedM.size(), "calibration terminal complete M");
+  require(calibrationCalls == callsBefore + 1 && grayCopies == copiesBefore + 2,
+          "calibration stages two planes and submits one terminal");
+  require(calibrationRect == std::array<uint16_t, 4>{144, 75, 320, 350}, "calibration aligned physical rectangle");
+  require(graySubmissions == grayBefore && baseSubmissions == baseBefore && submissions == binaryBefore,
+          "calibration has no ordinary gray or base activation");
+  expect(physical.data(), savedB.data(), savedB.size(), "calibration preserves B");
+
+  for (bool lsb : {true, false}) {
+    renderer.beginDisplayWork(); renderer.clearScreen();
+    require(renderer.drawCoverage(1, 3, 2), "calibration cancellation marker");
+    const int before = calibrationCalls, copies = grayCopies;
+    grayCopyAbortRenderer = &renderer; grayCopyAbortLsb = lsb;
+    renderer.displayGrayCalibration(55, 144, 350, 320);
+    grayCopyAbortRenderer = nullptr;
+    require(grayCopies == copies + 2 && aborted, "calibration abort injected after selector copy");
+    require(calibrationCalls == before, "calibration copy abort suppresses terminal");
+    require(renderer.liveFrameNeedsRedraw(), "calibration copy abort invalidates retained tuple");
+  }
+
+  renderer.beginDisplayWork(); renderer.clearScreen();
+  const auto reject = [&](int x, int y, int width, int height, const char* name) {
+    const int before = calibrationCalls, copies = grayCopies;
+    renderer.displayGrayCalibration(x, y, width, height);
+    require(calibrationCalls == before && grayCopies == copies, name);
+  };
+  reject(55, 144, 0, 320, "calibration rejects empty rectangle");
+  reject(900, 900, 10, 10, "calibration rejects off-panel rectangle");
+  {
+    GfxRenderer::ScopedTarget scratch(renderer, Owner::ReaderScratch);
+    reject(55, 144, 350, 320, "calibration rejects scratch owner");
+  }
+  renderer.clearScreen();
+  {
+    GfxRenderer::FrameBufferLoan loan(renderer);
+    reject(55, 144, 350, 320, "calibration rejects loan");
+  }
+  reject(55, 144, 350, 320, "calibration rejects invalid live tuple");
+  renderer.clearScreen(); renderer.abortDisplayWork();
+  reject(55, 144, 350, 320, "calibration rejects prior cancellation");
+
+  renderer.beginDisplayWork();
+  require(renderer.setUiGrayEnabled(false), "calibration disables retention");
+  renderer.clearScreen();
+  stagedL.fill(0x22); stagedM.fill(0x66);
+  expectedL.fill(0x22); expectedM.fill(0x66);
+  const int legacyCalls = calibrationCalls, legacyCopies = grayCopies;
+  renderer.displayGrayCalibration(55, 144, 350, 320);
+  require(calibrationCalls == legacyCalls + 1 && grayCopies == legacyCopies,
+          "disabled calibration preserves existing selector staging");
+  expect(calibrationL.data(), expectedL.data(), expectedL.size(), "disabled calibration L unchanged");
+  expect(calibrationM.data(), expectedM.data(), expectedM.size(), "disabled calibration M unchanged");
+  require(calibrationRect == std::array<uint16_t, 4>{144, 75, 320, 350}, "disabled calibration rectangle unchanged");
+  require(graySubmissions == grayBefore && baseSubmissions == baseBefore && submissions == binaryBefore,
+          "calibration controls have no ordinary activation");
+  std::puts("PASS: actual renderer calibration complete staging, cancellation, guards and disabled control");
+}
 
 static void testLegacySnapshot(GfxRenderer& renderer) {
   using Result = GfxRenderer::FrameResult;
@@ -2272,6 +2378,7 @@ int main() {
   testReaderScratchImport(hal);
   testReaderAntiAliased(hal);
   testReaderRefreshControls(hal);
+  testCalibrationSubmission(hal);
   std::puts("PASS: actual renderer ownership, submission, imports, glyphs, opaque writers, image clipping and stale target controls");
   }
   require(liveAllocations == 0, "renderer destruction releases pair");
@@ -2635,6 +2742,16 @@ class RendererSeamTest(unittest.TestCase):
                 ("scratch write before validation", "if (!bwBufferStored_) return false; if (bwBufferChunks.size()",
                  "if (!bwBufferStored_) return false; memcpy(frameBuffer, bwBufferChunks.front(), BW_BUFFER_CHUNK_SIZE); if (bwBufferChunks.size()",
                  "missing final chunk rejects before any B write: byte 0 expected 33, actual CC"),
+            ]
+            mutants += [
+                ("omit calibration retained staging",
+                 "if (!rect.valid) return; if (!canSubmit()) return; if (uiGrayEnabled_) { display.copyGrayscaleLsbBuffers(liveL_); display.copyGrayscaleMsbBuffers(liveM_); } if (!accountCancellation()) display.displayGrayCalibration",
+                 "if (!rect.valid) return; if (!canSubmit()) return; if (!accountCancellation()) display.displayGrayCalibration",
+                 "calibration terminal complete L: byte 47800 expected 10, actual 00"),
+                ("omit calibration abort recheck",
+                 "if (!accountCancellation()) display.displayGrayCalibration(rect.x, rect.y, rect.w, rect.h);",
+                 "display.displayGrayCalibration(rect.x, rect.y, rect.w, rect.h);",
+                 "calibration copy abort suppresses terminal: expected true, actual false"),
             ]
             for name, original, replacement, expected_error in mutants:
                 pattern = r"\s+".join(re.escape(part) for part in original.split())

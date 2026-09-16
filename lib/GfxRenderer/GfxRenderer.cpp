@@ -2626,7 +2626,12 @@ void GfxRenderer::displayGrayCalibration(const int customX, const int customY, c
   const AlignedMemRect rect =
       screenRectToAlignedMemRect(orientation, customX, customY, customW, customH, panelWidth, panelHeight);
   if (!rect.valid) return;
-  if (canSubmit()) display.displayGrayCalibration(rect.x, rect.y, rect.w, rect.h);
+  if (!canSubmit()) return;
+  if (uiGrayEnabled_) {
+    display.copyGrayscaleLsbBuffers(liveL_);
+    display.copyGrayscaleMsbBuffers(liveM_);
+  }
+  if (!accountCancellation()) display.displayGrayCalibration(rect.x, rect.y, rect.w, rect.h);
 }
 
 void GfxRenderer::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* scratch, int yStart, int numRows) const {
